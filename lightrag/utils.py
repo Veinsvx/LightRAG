@@ -18,6 +18,7 @@ import numpy as np
 import tiktoken
 from lightrag.prompt import PROMPTS
 from dotenv import load_dotenv
+from .base import BaseKVStorage
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -505,108 +506,114 @@ def process_combine_contexts(hl: str, ll: str):
 
 
 async def get_best_cached_response(
-    hashing_kv,
-    current_embedding,
-    similarity_threshold=0.95,
-    mode="default",
-    use_llm_check=False,
-    llm_func=None,
-    original_prompt=None,
-    cache_type=None,
+    hashing_kv: BaseKVStorage, # 类型提示
+    current_embedding: np.ndarray,
+    similarity_threshold: float = 0.95,
+    mode: str = "default",
+    folder_id: int | None = None, # <--- 新增参数
+    use_llm_check: bool = False,
+    llm_func: Callable | None = None,
+    original_prompt: str | None = None,
+    cache_type: str | None = None,
 ) -> str | None:
-    logger.debug(
-        f"get_best_cached_response:  mode={mode} cache_type={cache_type} use_llm_check={use_llm_check}"
-    )
-    mode_cache = await hashing_kv.get_by_id(mode)
-    if not mode_cache:
+    """Finds the best cached response based on embedding similarity within a folder."""
+    if folder_id is None:
+        logger.warning("folder_id is required for get_best_cached_response. No cache retrieved.")
         return None
 
-    best_similarity = -1
+    logger.debug(
+        f"get_best_cached_response: folder={folder_id} mode={mode} cache_type={cache_type} use_llm_check={use_llm_check}"
+    )
+
+    # 获取指定 folder 和 mode 的缓存数据
+    mode_cache = await hashing_kv.get_by_id(mode, folder_id=folder_id)
+    if not mode_cache:
+        logger.debug(f"No cache found for mode '{mode}' in folder {folder_id}.")
+        return None # 没有该模式的缓存
+
+    best_similarity = -1.0
     best_response = None
     best_prompt = None
     best_cache_id = None
 
-    # Only iterate through cache entries for this mode
+    # 仅迭代当前 folder+mode 的缓存条目
     for cache_id, cache_data in mode_cache.items():
-        # Skip if cache_type doesn't match
+        # 检查 cache_type 是否匹配
         if cache_type and cache_data.get("cache_type") != cache_type:
             continue
+        # 检查是否存在 embedding 数据
+        if cache_data.get("embedding") is None or cache_data.get("embedding_shape") is None:
+             logger.warning(f"Cache entry {cache_id} in folder {folder_id} is missing embedding data.")
+             continue
 
-        if cache_data["embedding"] is None:
-            continue
+        try:
+            # 反量化 embedding
+            cached_quantized = np.frombuffer(
+                bytes.fromhex(cache_data["embedding"]), dtype=np.uint8
+            ).reshape(cache_data["embedding_shape"])
+            cached_embedding = dequantize_embedding( # dequantize_embedding 需要导入或定义
+                cached_quantized,
+                cache_data["embedding_min"],
+                cache_data["embedding_max"],
+            )
 
-        # Convert cached embedding list to ndarray
-        cached_quantized = np.frombuffer(
-            bytes.fromhex(cache_data["embedding"]), dtype=np.uint8
-        ).reshape(cache_data["embedding_shape"])
-        cached_embedding = dequantize_embedding(
-            cached_quantized,
-            cache_data["embedding_min"],
-            cache_data["embedding_max"],
-        )
+            # 计算相似度
+            similarity = cosine_similarity(current_embedding, cached_embedding) # cosine_similarity 需要导入或定义
 
-        similarity = cosine_similarity(current_embedding, cached_embedding)
-        if similarity > best_similarity:
-            best_similarity = similarity
-            best_response = cache_data["return"]
-            best_prompt = cache_data["original_prompt"]
-            best_cache_id = cache_id
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_response = cache_data.get("return") # 使用 .get 以防万一
+                best_prompt = cache_data.get("original_prompt")
+                best_cache_id = cache_id
+        except Exception as e:
+             logger.error(f"Error processing cache entry {cache_id} in folder {folder_id}: {e}")
+             continue # 跳过有问题的条目
 
-    if best_similarity > similarity_threshold:
-        # If LLM check is enabled and all required parameters are provided
-        if (
-            use_llm_check
-            and llm_func
-            and original_prompt
-            and best_prompt
-            and best_response is not None
-        ):
+    # 检查最佳相似度是否超过阈值
+    if best_response is not None and best_similarity >= similarity_threshold:
+        # --- LLM 检查逻辑 (如果启用) ---
+        if use_llm_check and llm_func and original_prompt and best_prompt:
             compare_prompt = PROMPTS["similarity_check"].format(
                 original_prompt=original_prompt, cached_prompt=best_prompt
             )
-
             try:
                 llm_result = await llm_func(compare_prompt)
                 llm_result = llm_result.strip()
                 llm_similarity = float(llm_result)
 
-                # Replace vector similarity with LLM similarity score
-                best_similarity = llm_similarity
-                if best_similarity < similarity_threshold:
+                # 使用 LLM 的相似度进行最终判断
+                if llm_similarity < similarity_threshold:
+                    # LLM 判定不够相似，拒绝缓存
                     log_data = {
-                        "event": "cache_rejected_by_llm",
-                        "type": cache_type,
-                        "mode": mode,
-                        "original_question": original_prompt[:100] + "..."
-                        if len(original_prompt) > 100
-                        else original_prompt,
-                        "cached_question": best_prompt[:100] + "..."
-                        if len(best_prompt) > 100
-                        else best_prompt,
-                        "similarity_score": round(best_similarity, 4),
-                        "threshold": similarity_threshold,
+                        # ... (日志内容)
+                        "folder_id": folder_id,
                     }
                     logger.debug(json.dumps(log_data, ensure_ascii=False))
-                    logger.info(f"Cache rejected by LLM(mode:{mode} tpye:{cache_type})")
-                    return None
-            except Exception as e:  # Catch all possible exceptions
-                logger.warning(f"LLM similarity check failed: {e}")
-                return None  # Return None directly when LLM check fails
+                    logger.info(f"Cache rejected by LLM (folder:{folder_id} mode:{mode} type:{cache_type}) similarity: {llm_similarity:.4f}")
+                    return None # 返回 None 表示缓存未命中
+                else:
+                     # LLM 判定相似，使用 LLM 的分数更新 best_similarity 用于日志记录
+                     best_similarity = llm_similarity
 
-        prompt_display = (
-            best_prompt[:50] + "..." if len(best_prompt) > 50 else best_prompt
-        )
+            except Exception as e:
+                logger.warning(f"LLM similarity check failed for folder {folder_id}: {e}")
+                # LLM 检查失败时，是返回 None (拒绝缓存) 还是回退到向量相似度？
+                # 为了安全起见，返回 None
+                return None
+
+        # --- 缓存命中 ---
+        prompt_display = best_prompt[:50] + "..." if best_prompt and len(best_prompt) > 50 else best_prompt
         log_data = {
-            "event": "cache_hit",
-            "type": cache_type,
-            "mode": mode,
-            "similarity": round(best_similarity, 4),
-            "cache_id": best_cache_id,
+            "event": "cache_hit", "folder_id": folder_id, "type": cache_type, "mode": mode,
+            "similarity": round(best_similarity, 4), "cache_id": best_cache_id,
             "original_prompt": prompt_display,
         }
         logger.debug(json.dumps(log_data, ensure_ascii=False))
-        return best_response
-    return None
+        return best_response # 返回缓存内容
+
+    # 相似度未达到阈值
+    logger.debug(f"Highest similarity {best_similarity:.4f} below threshold {similarity_threshold} for folder {folder_id}")
+    return None # 缓存未命中
 
 
 def cosine_similarity(v1, v2):
@@ -643,68 +650,112 @@ def dequantize_embedding(
 
 
 async def handle_cache(
-    hashing_kv,
-    args_hash,
-    prompt,
-    mode="default",
-    cache_type=None,
+    hashing_kv: BaseKVStorage | None, # 类型提示用 BaseKVStorage
+    args_hash: str,
+    prompt: str,
+    mode: str = "default",
+    cache_type: str | None = None,
+    folder_id: int | None = None, # <--- 新增参数
 ):
-    """Generic cache handling function"""
+    """Generic cache handling function, now tenant-aware."""
+    # 如果没有缓存存储或未提供 folder_id (对于需要隔离的模式)，则直接返回
     if hashing_kv is None:
         return None, None, None, None
+    # 对于非 'default' 模式 (即各种查询模式)，folder_id 是必需的
+    if mode != "default" and folder_id is None:
+         logger.warning(f"folder_id is required for caching mode '{mode}'. Cache lookup skipped.")
+         # 或者 raise ValueError("folder_id required for non-default cache mode")
+         return None, None, None, None
 
-    if mode != "default":  # handle cache for all type of query
-        if not hashing_kv.global_config.get("enable_llm_cache"):
-            return None, None, None, None
+    # 全局配置检查 (例如 enable_llm_cache)
+    global_enable_cache = True # 默认启用
+    embedding_cache_config = {"enabled": False} # 默认禁用 embedding cache
 
-        # Get embedding cache configuration
-        embedding_cache_config = hashing_kv.global_config.get(
-            "embedding_cache_config",
-            {"enabled": False, "similarity_threshold": 0.95, "use_llm_check": False},
-        )
-        is_embedding_cache_enabled = embedding_cache_config["enabled"]
-        use_llm_check = embedding_cache_config.get("use_llm_check", False)
+    if hasattr(hashing_kv, 'global_config'):
+         global_config = hashing_kv.global_config
+         # 检查特定模式的缓存是否启用
+         if mode == "default": # 假设 'default' 对应 entity extraction
+              global_enable_cache = global_config.get("enable_llm_cache_for_entity_extract", True)
+         else: # 其他查询模式
+              global_enable_cache = global_config.get("enable_llm_cache", True)
 
-        quantized = min_val = max_val = None
-        if is_embedding_cache_enabled:  # Use embedding simularity to match cache
-            current_embedding = await hashing_kv.embedding_func([prompt])
-            llm_model_func = hashing_kv.global_config.get("llm_model_func")
-            quantized, min_val, max_val = quantize_embedding(current_embedding[0])
-            best_cached_response = await get_best_cached_response(
-                hashing_kv,
-                current_embedding[0],
-                similarity_threshold=embedding_cache_config["similarity_threshold"],
-                mode=mode,
-                use_llm_check=use_llm_check,
-                llm_func=llm_model_func if use_llm_check else None,
-                original_prompt=prompt,
-                cache_type=cache_type,
-            )
-            if best_cached_response is not None:
-                logger.debug(f"Embedding cached hit(mode:{mode} type:{cache_type})")
-                return best_cached_response, None, None, None
-            else:
-                # if caching keyword embedding is enabled, return the quantized embedding for saving it latter
-                logger.debug(f"Embedding cached missed(mode:{mode} type:{cache_type})")
-                return None, quantized, min_val, max_val
-
-    else:  # handle cache for entity extraction
-        if not hashing_kv.global_config.get("enable_llm_cache_for_entity_extract"):
-            return None, None, None, None
-
-    # Here is the conditions of code reaching this point:
-    #     1. All query mode: enable_llm_cache is True and embedding simularity is not enabled
-    #     2. Entity extract: enable_llm_cache_for_entity_extract is True
-    if exists_func(hashing_kv, "get_by_mode_and_id"):
-        mode_cache = await hashing_kv.get_by_mode_and_id(mode, args_hash) or {}
+         embedding_cache_config = global_config.get(
+              "embedding_cache_config",
+              {"enabled": False, "similarity_threshold": 0.95, "use_llm_check": False}
+         )
     else:
-        mode_cache = await hashing_kv.get_by_id(mode) or {}
-    if args_hash in mode_cache:
-        logger.debug(f"Non-embedding cached hit(mode:{mode} type:{cache_type})")
-        return mode_cache[args_hash]["return"], None, None, None
+         logger.warning("hashing_kv does not have global_config attribute. Assuming cache is enabled.")
 
-    logger.debug(f"Non-embedding cached missed(mode:{mode} type:{cache_type})")
-    return None, None, None, None
+
+    if not global_enable_cache:
+         return None, None, None, None
+
+
+    # --- 基于 Embedding 的缓存查找 (需要 folder_id) ---
+    is_embedding_cache_enabled = embedding_cache_config["enabled"]
+    quantized = min_val = max_val = None
+
+    # 仅当 embedding cache 启用且 folder_id 有效时执行
+    if is_embedding_cache_enabled and mode != "default" and folder_id is not None:
+        use_llm_check = embedding_cache_config.get("use_llm_check", False)
+        llm_model_func = getattr(hashing_kv, 'global_config', {}).get("llm_model_func") if use_llm_check else None
+
+        current_embedding = await hashing_kv.embedding_func([prompt])
+        quantized, min_val, max_val = quantize_embedding(current_embedding[0]) # quantize_embedding 需要导入或定义
+
+        # 调用修改后的 get_best_cached_response
+        best_cached_response = await get_best_cached_response(
+            hashing_kv,
+            current_embedding[0],
+            similarity_threshold=embedding_cache_config["similarity_threshold"],
+            mode=mode,
+            folder_id=folder_id, # <--- 传递 folder_id
+            use_llm_check=use_llm_check,
+            llm_func=llm_model_func,
+            original_prompt=prompt,
+            cache_type=cache_type,
+        )
+        if best_cached_response is not None:
+            logger.debug(f"Embedding cache hit (folder:{folder_id} mode:{mode} type:{cache_type})")
+            return best_cached_response, None, None, None
+        else:
+            logger.debug(f"Embedding cache missed (folder:{folder_id} mode:{mode} type:{cache_type})")
+            # 返回 None 表示未命中，但返回量化信息以便后续保存
+            return None, quantized, min_val, max_val
+
+    # --- 基于 Hash 的缓存查找 (需要 folder_id) ---
+    # 检查是否存在特定于租户的 get 方法
+    if hasattr(hashing_kv, "get_by_mode_and_id") and folder_id is not None:
+         # 这个方法可能不是我们 TenantAwareRedisKVStorage 的标准部分
+         # 我们需要使用 get_by_id 并传入 mode 作为 key 的一部分
+         # mode_cache = await hashing_kv.get_by_mode_and_id(mode, args_hash, folder_id=folder_id) or {} # 假设有此方法
+         # 使用 get_by_id(key=mode) 更符合我们 TenantAwareRedisKVStorage 的设计
+         mode_cache_content = await hashing_kv.get_by_id(mode, folder_id=folder_id)
+         mode_cache = mode_cache_content if mode_cache_content else {}
+
+    elif folder_id is not None: # 使用标准的 get_by_id
+         mode_cache_content = await hashing_kv.get_by_id(mode, folder_id=folder_id)
+         mode_cache = mode_cache_content if mode_cache_content else {}
+    elif mode == "default": # 对于 default 模式，如果不需要隔离，可以考虑不传 folder_id
+         # 但为了统一，最好总是传递 folder_id，如果 default 模式不需要隔离，
+         # TenantAwareRedisKVStorage 的 _get_tenant_key 可以特殊处理 folder_id=None
+         # 这里我们假设所有模式都需要 folder_id
+         logger.warning(f"folder_id is None for handle_cache mode '{mode}', hash lookup skipped.")
+         return None, None, None, None
+    else: # folder_id is None for non-default mode - 已在前面处理
+         return None, None, None, None
+
+
+    # 检查 hash 是否在当前 folder 的 mode cache 中
+    if args_hash in mode_cache:
+         # 检查 cache_type 是否匹配 (如果提供了 cache_type)
+         cache_entry = mode_cache[args_hash]
+         if cache_type is None or cache_entry.get("cache_type") == cache_type:
+              logger.debug(f"Hash cache hit (folder:{folder_id} mode:{mode} type:{cache_type})")
+              return cache_entry.get("return"), None, None, None # 返回缓存内容
+
+    logger.debug(f"Hash cache missed (folder:{folder_id} mode:{mode} type:{cache_type})")
+    return None, None, None, None # 明确返回 None 表示未命中
 
 
 @dataclass
@@ -719,57 +770,74 @@ class CacheData:
     cache_type: str = "query"
 
 
-async def save_to_cache(hashing_kv, cache_data: CacheData):
-    """Save data to cache, with improved handling for streaming responses and duplicate content.
-
-    Args:
-        hashing_kv: The key-value storage for caching
-        cache_data: The cache data to save
-    """
-    # Skip if storage is None or content is a streaming response
-    if hashing_kv is None or not cache_data.content:
+async def save_to_cache(
+    hashing_kv: BaseKVStorage | None, # 类型提示用 BaseKVStorage
+    cache_data: CacheData,
+    folder_id: int | None = None, # <--- 新增参数
+):
+    """Save data to cache within a specific folder, with improved handling."""
+    # --- 前置检查 ---
+    if hashing_kv is None: return
+    if not cache_data.content: return # 不缓存空内容
+    if hasattr(cache_data.content, "__aiter__"): # 不缓存流式响应
+        logger.debug("Streaming response detected, skipping cache save")
         return
 
-    # If content is a streaming response, don't cache it
-    if hasattr(cache_data.content, "__aiter__"):
-        logger.debug("Streaming response detected, skipping cache")
+    # 对于非 'default' 模式，folder_id 是必需的
+    if cache_data.mode != "default" and folder_id is None:
+        logger.warning(f"folder_id is required to save cache for mode '{cache_data.mode}'. Save skipped.")
         return
 
-    # Get existing cache data
-    if exists_func(hashing_kv, "get_by_mode_and_id"):
-        mode_cache = (
-            await hashing_kv.get_by_mode_and_id(cache_data.mode, cache_data.args_hash)
-            or {}
-        )
-    else:
-        mode_cache = await hashing_kv.get_by_id(cache_data.mode) or {}
+    # 全局配置检查 (逻辑同 handle_cache)
+    global_enable_cache = True
+    if hasattr(hashing_kv, 'global_config'):
+         global_config = hashing_kv.global_config
+         if cache_data.mode == "default":
+              global_enable_cache = global_config.get("enable_llm_cache_for_entity_extract", True)
+         else:
+              global_enable_cache = global_config.get("enable_llm_cache", True)
 
-    # Check if we already have identical content cached
+    if not global_enable_cache:
+         return
+
+    # --- 获取当前 folder 的缓存 ---
+    try:
+        # 使用 tenant-aware get_by_id 获取当前 folder+mode 的数据
+        mode_cache_content = await hashing_kv.get_by_id(cache_data.mode, folder_id=folder_id)
+        mode_cache = mode_cache_content if mode_cache_content else {}
+    except Exception as e:
+        logger.error(f"Error retrieving cache for mode '{cache_data.mode}' in folder {folder_id}: {e}")
+        mode_cache = {} # 出错时假定为空，尝试覆盖
+
+    # --- 检查内容是否重复 ---
     if cache_data.args_hash in mode_cache:
-        existing_content = mode_cache[cache_data.args_hash].get("return")
-        if existing_content == cache_data.content:
-            logger.info(
-                f"Cache content unchanged for {cache_data.args_hash}, skipping update"
-            )
-            return
+        existing_entry = mode_cache[cache_data.args_hash]
+        # 比较核心内容，忽略 embedding 等元数据
+        if existing_entry.get("return") == cache_data.content:
+            logger.debug(f"Cache content unchanged for hash {cache_data.args_hash} in folder {folder_id}, skipping update.")
+            return # 内容未变，无需保存
 
-    # Update cache with new content
-    mode_cache[cache_data.args_hash] = {
+    # --- 准备新的缓存条目 ---
+    new_cache_entry = {
         "return": cache_data.content,
         "cache_type": cache_data.cache_type,
-        "embedding": cache_data.quantized.tobytes().hex()
-        if cache_data.quantized is not None
-        else None,
-        "embedding_shape": cache_data.quantized.shape
-        if cache_data.quantized is not None
-        else None,
+        "embedding": cache_data.quantized.tobytes().hex() if cache_data.quantized is not None else None,
+        "embedding_shape": cache_data.quantized.shape if cache_data.quantized is not None else None,
         "embedding_min": cache_data.min_val,
         "embedding_max": cache_data.max_val,
-        "original_prompt": cache_data.prompt,
+        "original_prompt": cache_data.prompt, # 保存原始提示用于 LLM 检查 (如果启用)
     }
 
-    # Only upsert if there's actual new content
-    await hashing_kv.upsert({cache_data.mode: mode_cache})
+    # 更新 mode_cache 字典
+    mode_cache[cache_data.args_hash] = new_cache_entry
+
+    # --- 保存更新后的缓存到 Redis ---
+    try:
+        # 使用 tenant-aware upsert 保存整个 mode 的数据
+        await hashing_kv.upsert({cache_data.mode: mode_cache}, folder_id=folder_id)
+        logger.debug(f"Cache saved for hash {cache_data.args_hash} in folder {folder_id} mode {cache_data.mode}")
+    except Exception as e:
+        logger.error(f"Error saving cache for mode '{cache_data.mode}' in folder {folder_id}: {e}")
 
 
 def safe_unicode_decode(content):
