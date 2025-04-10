@@ -7,7 +7,6 @@ from redis.asyncio import Redis, ConnectionPool
 from redis.exceptions import RedisError, ConnectionError
 from lightrag.utils import logger
 from lightrag.kg.redis_impl import RedisKVStorage # 假设原始实现在这里
-from lightrag.base import EmbeddingFunc # 导入基类或类型
 
 # Constants from original file (if needed)
 MAX_CONNECTIONS = 50
@@ -216,7 +215,7 @@ class TenantAwareRedisKVStorage(RedisKVStorage):
 
     # --- Add embedding_func parameter to match base class ---
     # The base class __init__ might handle this, but let's ensure it's present.
-    embedding_func: EmbeddingFunc | None = None # Allow None if not always needed
+    #embedding_func: EmbeddingFunc | None = None # Allow None if not always needed
 
     # We might need to explicitly call the superclass __init__ or __post_init__
     # if it does important setup. Let's assume the @dataclass handles it for now.

@@ -18,7 +18,9 @@ import numpy as np
 import tiktoken
 from lightrag.prompt import PROMPTS
 from dotenv import load_dotenv
-from .base import BaseKVStorage
+from typing import TYPE_CHECKING, Callable, Any
+if TYPE_CHECKING:
+    from .base import BaseKVStorage # Move import here
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance

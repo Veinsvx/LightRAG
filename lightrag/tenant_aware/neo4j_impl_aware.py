@@ -3,12 +3,11 @@ import os
 import re
 import numpy as np
 from dataclasses import dataclass
-from typing import Any, final, List, Tuple
+from typing import Any, final, List, Tuple, Union
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from neo4j import AsyncGraphDatabase, exceptions as neo4jExceptions, AsyncDriver, AsyncManagedTransaction
+from neo4j import AsyncGraphDatabase, exceptions as neo4jExceptions, AsyncDriver, AsyncManagedTransaction, Session
 from lightrag.utils import logger
 from lightrag.kg.neo4j_impl import Neo4JStorage # 假设原始实现在这里
-from lightrag.base import EmbeddingFunc # 导入基类或类型
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge # 确保导入类型
 
 MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000)) # 从原始文件获取
@@ -25,35 +24,78 @@ class TenantAwareNeo4JStorage(Neo4JStorage):
     # Override __init__ or __post_init__ if needed
     # Keep the original initialization logic, maybe add folder_id index creation check
 
+    # Inherits _driver and _DATABASE from base class after super().initialize()
+
+    async def _ensure_neo4j_index(self, session: Session, index_name: str, label: str, properties: Union[str, List[str]]):
+        """Helper to create a Neo4j index if it doesn't exist."""
+        # Ensure properties input is handled correctly for Cypher syntax
+        if isinstance(properties, list):
+            # For composite index: n.`property1`, n.`property2`
+            prop_str_cypher = ", ".join([f"n.`{p}`" for p in properties])
+            prop_str_log = ", ".join(properties) # For logging
+        else:
+            # For single property index: n.`property`
+            prop_str_cypher = f"n.`{properties}`"
+            prop_str_log = properties
+
+        # Use CREATE INDEX ... IF NOT EXISTS for idempotency
+        create_index_cypher = f"CREATE INDEX {index_name} IF NOT EXISTS FOR (n:{label}) ON ({prop_str_cypher})"
+        try:
+             result = await session.run(create_index_cypher)
+             await result.consume()
+             # Log success regardless of whether it was created now or existed before
+             logger.info(f"Ensured Neo4j index '{index_name}' exists for label '{label}' on properties '{prop_str_log}' in db '{self._DATABASE}'.")
+        except neo4jExceptions.ClientError as e:
+            # Handle potential errors, e.g., conflicting index definition
+            if "already exists" in str(e) or "concurrently" in str(e): # Check common messages
+                logger.debug(f"Index matching config for {label}({prop_str_log}) likely exists (maybe under different name or concurrent creation). Index name: '{index_name}'.")
+            else:
+                logger.warning(f"Could not ensure Neo4j index '{index_name}': {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error ensuring Neo4j index '{index_name}': {e}")
+
     async def initialize(self):
-        """Initializes the driver and ensures folder_id index exists."""
-        await super().initialize() # Call base class initialization
-        # Ensure index on folder_id exists
+        """
+        Initializes the driver by calling the base class method,
+        then ensures necessary tenant-aware indexes exist.
+        """
+        if self._driver:
+             logger.debug("Neo4j driver already seems initialized. Skipping base initialization.")
+             # Even if driver exists, ensure indexes on the target DB
+        else:
+            # Call the base class initialize FIRST to set up self._driver and self._DATABASE
+            logger.debug("Calling super().initialize() to set up Neo4j driver and database connection...")
+            await super().initialize()
+            logger.debug(f"Base initialization complete. Using database: '{self._DATABASE}'")
+
+
+        # Now, ensure indexes exist using the initialized driver and database
         if self._driver and self._DATABASE:
             async with self._driver.session(database=self._DATABASE) as session:
-                try:
-                    # Check if index exists first (adapt query if needed for specific Neo4j versions)
-                    check_query = """
-                    CALL db.indexes() YIELD name, labelsOrTypes, properties
-                    WHERE 'base' IN labelsOrTypes AND properties = ['folder_id']
-                    RETURN count(*) > 0 AS exists
-                    """
-                    index_exists = False
-                    try:
-                         check_result = await session.run(check_query)
-                         record = await check_result.single()
-                         await check_result.consume()
-                         index_exists = record and record.get("exists", False)
-                    except Exception: # Fallback if db.indexes() fails
-                         pass # Assume index might exist or try creating it
+                 logger.info(f"Ensuring required indexes exist in Neo4j database '{self._DATABASE}'...")
+                 try:
+                      # 1. Index on :base(entity_id) - Good for general lookups
+                      await self._ensure_neo4j_index(session, "base_entity_id_idx", "base", "entity_id")
 
-                    if not index_exists:
-                        index_query = "CREATE INDEX tenant_folder_id IF NOT EXISTS FOR (n:base) ON (n.folder_id)"
-                        result = await session.run(index_query)
-                        await result.consume()
-                        logger.info(f"Ensured index on :base(folder_id) exists in database {self._DATABASE}")
-                except Exception as e:
-                    logger.warning(f"Could not ensure index on :base(folder_id): {str(e)}")
+                      # 2. Index on :base(folder_id) - Essential for tenant filtering
+                      await self._ensure_neo4j_index(session, "base_folder_id_idx", "base", "folder_id")
+
+                      # 3. Composite Index on :base(entity_id, folder_id) - Recommended for MERGE performance
+                      await self._ensure_neo4j_index(session, "base_entity_folder_comp_idx", "base", ["entity_id", "folder_id"])
+
+                      logger.info(f"Required Neo4j indexes ensured for database '{self._DATABASE}'.")
+
+                 except Exception as e:
+                      # Catch errors during the session or index creation phase
+                      logger.error(f"Failed to ensure indexes in database '{self._DATABASE}': {e}")
+                      # Decide if this is fatal. It might impact performance significantly.
+                      # raise # Optionally re-raise the error
+        elif not self._driver:
+             logger.error("Neo4j driver was not initialized by base class. Cannot ensure indexes.")
+             raise RuntimeError("Neo4j driver initialization failed.")
+        elif not self._DATABASE:
+             logger.error("Neo4j database name (_DATABASE) was not set by base class. Cannot ensure indexes.")
+             raise RuntimeError("Neo4j database name initialization failed.")
 
 
     # --- Override CRUD and Query Methods ---

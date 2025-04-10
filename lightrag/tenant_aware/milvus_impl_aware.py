@@ -5,9 +5,9 @@ from typing import Any, final, List
 from dataclasses import dataclass
 import numpy as np
 from pymilvus import MilvusClient, DataType, FieldSchema, CollectionSchema # 确保导入必要类型
+from pymilvus.exceptions import IndexNotExistException, CollectionNotExistException, MilvusException
 from lightrag.utils import logger, compute_mdhash_id
 from lightrag.kg.milvus_impl import MilvusVectorDBStorage # 假设原始实现在这里
-from lightrag.base import EmbeddingFunc # 导入基类或类型
 
 @final
 @dataclass
@@ -23,76 +23,109 @@ class TenantAwareMilvusVectorDBStorage(MilvusVectorDBStorage):
 
     # Override __post_init__ to ensure schema and index exist
     def __post_init__(self):
-        # Run original post_init first
+        # Run original post_init first (handles client creation etc.)
         super().__post_init__()
+        if MilvusClient is None: # Check if import failed
+             logger.error("pymilvus is not installed. Cannot initialize TenantAwareMilvusVectorDBStorage.")
+             return # Prevent further initialization if library is missing
 
-        # Ensure the collection exists and has the required schema
-        self._ensure_collection_schema()
+        # Ensure the collection exists and has the required schema and indexes
+        self._ensure_collection_schema_and_indexes()
 
-    def _ensure_collection_schema(self):
-        """Ensures the Milvus collection exists and has the folder_id field."""
+    def _check_index_exists(self, field_name: str) -> bool:
+        """Checks if an index exists for the given field."""
         try:
-            if not self._client.has_collection(self.namespace):
-                logger.info(f"Collection {self.namespace} does not exist. Creating...")
+            indexes = self._client.list_indexes(self.namespace)
+            for index_name in indexes:
+                 try:
+                     index_desc = self._client.describe_index(self.namespace, index_name)
+                     if index_desc and index_desc.field_name == field_name:
+                          logger.debug(f"Index '{index_name}' found for field '{field_name}' in collection '{self.namespace}'.")
+                          return True
+                 except MilvusException as desc_err:
+                      # Handle potential errors if index description fails
+                      logger.warning(f"Could not describe index '{index_name}': {desc_err}")
+            logger.debug(f"No index found for field '{field_name}' in collection '{self.namespace}'.")
+            return False
+        except CollectionNotExistException:
+             logger.debug(f"Collection '{self.namespace}' does not exist when checking index for '{field_name}'.")
+             return False # Collection doesn't exist, so index doesn't either
+        except Exception as e:
+            logger.error(f"Error checking index for field '{field_name}': {e}")
+            return False # Assume index doesn't exist on error
+
+
+    def _ensure_collection_schema_and_indexes(self):
+        """Ensures collection, schema, vector index, and scalar index exist."""
+        try:
+            collection_exists = self._client.has_collection(self.namespace)
+
+            if not collection_exists:
+                logger.info(f"Collection '{self.namespace}' does not exist. Creating...")
                 # Define schema fields
                 fields = [
-                    FieldSchema(name=self.primary_field, dtype=DataType.VARCHAR, is_primary=True, max_length=65535), # Adjusted max_length
+                    FieldSchema(name=self.primary_field, dtype=DataType.VARCHAR, is_primary=True, max_length=65535),
                     FieldSchema(name=self.folder_id_field, dtype=DataType.INT64), # Tenant ID field
                     FieldSchema(name=self.vector_field, dtype=DataType.FLOAT_VECTOR, dim=self.embedding_func.embedding_dim),
-                     # Add other meta fields defined in the base class or config
-                     # Example: FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-                     # Example: FieldSchema(name="file_path", dtype=DataType.VARCHAR, max_length=1024),
-                     # Dynamically add fields from self.meta_fields if possible/needed
-                     # For simplicity, assume necessary meta fields are manually added or not strictly required by schema
                 ]
-                # Include meta fields dynamically - requires knowing their types
-                # Example (assuming all meta fields are VARCHAR for simplicity):
+                # Dynamically add meta fields (assuming VARCHAR for simplicity)
                 for meta_field_name in self.meta_fields:
-                     if meta_field_name not in [self.primary_field, self.folder_id_field, self.vector_field]:
-                          # You might need a mapping for types or make assumptions
-                          fields.append(FieldSchema(name=meta_field_name, dtype=DataType.VARCHAR, max_length=65535))
-
+                    if meta_field_name not in [self.primary_field, self.folder_id_field, self.vector_field]:
+                        fields.append(FieldSchema(name=meta_field_name, dtype=DataType.VARCHAR, max_length=65535))
 
                 schema = CollectionSchema(fields=fields, description=f"Tenant-aware collection for {self.namespace}")
                 self._client.create_collection(collection_name=self.namespace, schema=schema)
-                logger.info(f"Created collection {self.namespace}")
-
-                # Create index on vector field
-                index_params = self._client.prepare_index_params()
-                index_params.add_index(
-                    field_name=self.vector_field,
-                    index_type="AUTOINDEX", # Or specify like "IVF_FLAT"
-                    metric_type="COSINE", # Or L2
-                    # params={"nlist": 1024} # Example params for IVF_FLAT
-                )
-                self._client.create_index(self.namespace, index_params)
-                logger.info(f"Created vector index on {self.vector_field} for {self.namespace}")
-
-                # Create index on folder_id field for efficient filtering
-                # Scalar field indexing might depend on Milvus version/configuration
-                # Try creating a MARISA_TRIE or default scalar index
-                try:
-                     scalar_index_params = self._client.prepare_index_params()
-                     scalar_index_params.add_index(field_name=self.folder_id_field) # Use default index type
-                     self._client.create_index(self.namespace, scalar_index_params, index_name=f"{self.folder_id_field}_idx")
-                     logger.info(f"Created scalar index on {self.folder_id_field} for {self.namespace}")
-                except Exception as index_err:
-                     logger.warning(f"Could not create scalar index on {self.folder_id_field} (may not be supported or necessary): {index_err}")
+                logger.info(f"Created collection '{self.namespace}'.")
+                collection_exists = True # Mark as created
 
             else:
-                logger.debug(f"Collection {self.namespace} already exists.")
-                # Optional: Verify existing schema has folder_id field here
-                # desc = self._client.describe_collection(self.namespace)
-                # field_names = [f.name for f in desc.fields]
-                # if self.folder_id_field not in field_names:
-                #     raise RuntimeError(f"Collection {self.namespace} exists but lacks the '{self.folder_id_field}' field.")
+                logger.debug(f"Collection '{self.namespace}' already exists.")
+                # Optional: Verify existing schema if needed
 
-            # Ensure collection is loaded
-            self._client.load_collection(self.namespace)
+            # --- Ensure Indexes Exist ---
+            if collection_exists:
+                 # 1. Ensure Vector Index Exists
+                 if not self._check_index_exists(self.vector_field):
+                      logger.info(f"Creating vector index on field '{self.vector_field}' for collection '{self.namespace}'...")
+                      try:
+                           vector_index_params = self._client.prepare_index_params()
+                           vector_index_params.add_index(
+                                field_name=self.vector_field,
+                                index_type="AUTOINDEX", # Or specific type like "IVF_FLAT"
+                                metric_type="COSINE",    # Or "L2"
+                                # params={"nlist": 1024} # Params for specific index types
+                           )
+                           self._client.create_index(self.namespace, vector_index_params, index_name=f"{self.vector_field}_idx")
+                           logger.info(f"Successfully created vector index on '{self.vector_field}'.")
+                      except Exception as e:
+                           logger.error(f"Failed to create vector index on '{self.vector_field}': {e}")
+                           # Decide if this is a fatal error
 
+                 # 2. Ensure Scalar Index Exists on folder_id
+                 if not self._check_index_exists(self.folder_id_field):
+                      logger.info(f"Creating scalar index on field '{self.folder_id_field}' for collection '{self.namespace}'...")
+                      try:
+                           scalar_index_params = self._client.prepare_index_params()
+                           scalar_index_params.add_index(field_name=self.folder_id_field) # Use default index
+                           self._client.create_index(self.namespace, scalar_index_params, index_name=f"{self.folder_id_field}_idx")
+                           logger.info(f"Successfully created scalar index on '{self.folder_id_field}'.")
+                      except Exception as e:
+                           # Log warning as scalar index might not be strictly required or supported
+                           logger.warning(f"Could not create scalar index on '{self.folder_id_field}' (may not be needed/supported): {e}")
 
+                 # 3. Load Collection
+                 logger.debug(f"Loading collection '{self.namespace}' into memory...")
+                 self._client.load_collection(self.namespace)
+                 logger.info(f"Collection '{self.namespace}' loaded.")
+
+        except CollectionNotExistException:
+             logger.error(f"Failed to create or access collection '{self.namespace}'. Please check Milvus connection and permissions.")
+             raise # Re-raise critical error
+        except MilvusException as e:
+             logger.error(f"A Milvus specific error occurred during schema/index setup for '{self.namespace}': {e}")
+             raise
         except Exception as e:
-            logger.error(f"Error ensuring Milvus collection schema for {self.namespace}: {e}")
+            logger.error(f"Unexpected error ensuring Milvus collection schema/indexes for '{self.namespace}': {e}")
             raise
 
     async def upsert(self, data: dict[str, dict[str, Any]], folder_id: int) -> None:

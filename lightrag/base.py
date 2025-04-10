@@ -10,10 +10,13 @@ from typing import (
     Literal,
     TypedDict,
     TypeVar,
+    TYPE_CHECKING,
     Callable,
 )
 import numpy as np
-from .utils import EmbeddingFunc
+if TYPE_CHECKING:
+    # This avoids runtime import but allows type checkers (like mypy) to see it
+    from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
 
 # use the .env that is inside the current folder
