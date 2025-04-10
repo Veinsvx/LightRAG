@@ -2,7 +2,7 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import Any, Set
+from typing import Any, Set ,Dict
 from redis.asyncio import Redis, ConnectionPool
 from redis.exceptions import RedisError, ConnectionError
 from lightrag.utils import logger
@@ -184,6 +184,35 @@ class TenantAwareRedisKVStorage(RedisKVStorage):
                    logger.error(f"Error dropping tenant data for folder {folder_id}: {e}")
                    return {"status": "error", "message": str(e)}
 
+    # get_all_in_folder 为了防止lightrag在adelete_by_doc_id中调用时报错，额外添加，但是应该重新实现，目前功能效果有问题。
+    async def get_all_in_folder(self, folder_id: int) -> Dict[str, Any]:
+        """Fetches all key-value pairs for a specific folder within the namespace."""
+        if folder_id is None:
+            raise ValueError("folder_id required for get_all_in_folder")
+
+        all_data = {}
+        pattern = f"folder:{folder_id}:{self.namespace}:*" # 构建匹配模式
+        async with self._get_redis_connection() as redis:
+            try:
+                async for key in redis.scan_iter(match=pattern):
+                    # 去掉前缀，得到原始 key
+                    original_key_parts = key.split(':')
+                    original_key = original_key_parts[-1] if len(original_key_parts) > 2 else key # 简单的去前缀逻辑
+                    try:
+                        value_str = await redis.get(key)
+                        if value_str:
+                            all_data[original_key] = json.loads(value_str)
+                        else:
+                            all_data[original_key] = None # 或者跳过 None 值
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode JSON for key: {key}")
+                        all_data[original_key] = None # 或标记为错误
+                    except Exception as e:
+                        logger.error(f"Error fetching/decoding key {key}: {e}")
+            except Exception as e:
+                logger.error(f"Error during SCAN for pattern {pattern}: {e}")
+                raise
+        return all_data
 
     # --- Add embedding_func parameter to match base class ---
     # The base class __init__ might handle this, but let's ensure it's present.

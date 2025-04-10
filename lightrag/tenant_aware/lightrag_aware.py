@@ -698,6 +698,8 @@ class MyTenantAwareLightRAG(LightRAG):
              await asyncio.gather(*delete_vdb_tasks)
              logger.info(f"Deleted {len(entities_to_delete)} orphaned entities from VDB in folder {folder_id}")
 
+        # 未来功能增强点 --- 额外步骤：清理关系 VDB 中与已删除实体相关的条目 ---
+
         # Relationship Cleanup (Potentially complex)
         # If graph `delete_node` uses `DETACH DELETE`, relationships are handled in graph.
         # We might still need to clean up relationship entries in VDB if they only referenced deleted entities/chunks.
