@@ -1321,6 +1321,7 @@ class LightRAG:
         query: str,
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
+        folder_id: int = 0,  # 添加默认值为0的folder_id参数
     ) -> str | AsyncIterator[str]:
         """
         Perform a async query.
@@ -1346,6 +1347,7 @@ class LightRAG:
                 self.text_chunks,
                 param,
                 global_config,
+                folder_id=folder_id,  # 传递folder_id参数
                 hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
                 system_prompt=system_prompt,
             )
@@ -1356,6 +1358,7 @@ class LightRAG:
                 self.text_chunks,
                 param,
                 global_config,
+                folder_id=folder_id,  # 传递folder_id参数
                 hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
                 system_prompt=system_prompt,
             )
@@ -1369,7 +1372,8 @@ class LightRAG:
                 self.text_chunks,
                 param,
                 global_config,
-                hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
+                folder_id=folder_id,  # 传递folder_id参数
+                hashing_kv=self.llm_response_cache,
                 system_prompt=system_prompt,
             )
         else:

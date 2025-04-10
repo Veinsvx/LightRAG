@@ -1,7 +1,12 @@
 import os
 import asyncio
-from lightrag import LightRAG, QueryParam
-from lightrag.llm.ollama import ollama_embed, openai_complete_if_cache
+from lightrag import QueryParam
+# 使用补丁版本
+import sys
+sys.path.append('/home/shao/SR_Assistance/KAG')
+from LightRAG_patch import PatchedLightRAG as LightRAG
+from lightrag.llm.ollama import ollama_embed
+from lightrag.llm.openai import openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc
 from lightrag.kg.shared_storage import initialize_pipeline_status
 
@@ -18,14 +23,14 @@ os.environ["REDIS_URI"] = "redis://localhost:6379"
 # neo4j
 BATCH_SIZE_NODES = 500
 BATCH_SIZE_EDGES = 100
-os.environ["NEO4J_URI"] = "bolt://117.50.173.35:7687"
+os.environ["NEO4J_URI"] = "neo4j://127.0.0.1:7687"
 os.environ["NEO4J_USERNAME"] = "neo4j"
-os.environ["NEO4J_PASSWORD"] = "12345678"
+os.environ["NEO4J_PASSWORD"] = "password"
 
 # milvus
-os.environ["MILVUS_URI"] = "http://117.50.173.35:19530"
+os.environ["MILVUS_URI"] = "http://localhost:19530"
 os.environ["MILVUS_USER"] = "root"
-os.environ["MILVUS_PASSWORD"] = "Milvus"
+os.environ["MILVUS_PASSWORD"] = "123456"
 os.environ["MILVUS_DB_NAME"] = "lightrag"
 
 
@@ -37,17 +42,17 @@ async def llm_model_func(
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        api_key="",
-        base_url="",
+        api_key="sk-c88e3601dec04829bd845e67f7bfd2bf",
+        base_url="https://api.deepseek.com/v1",
         **kwargs,
     )
 
 
 embedding_func = EmbeddingFunc(
-    embedding_dim=768,
+    embedding_dim=1024,
     max_token_size=512,
     func=lambda texts: ollama_embed(
-        texts, embed_model="shaw/dmeta-embedding-zh", host="http://117.50.173.35:11434"
+        texts, embed_model="quentinz/bge-large-zh-v1.5:f32", host="http://localhost:11434"
     ),
 )
 
@@ -63,7 +68,7 @@ async def initialize_rag():
         kv_storage="RedisKVStorage",
         graph_storage="Neo4JStorage",
         vector_storage="MilvusVectorDBStorage",
-        doc_status_storage="RedisKVStorage",
+        doc_status_storage="JsonDocStatusStorage",
     )
 
     await rag.initialize_storages()
@@ -77,8 +82,10 @@ def main():
     rag = asyncio.run(initialize_rag())
 
     with open("./book.txt", "r", encoding="utf-8") as f:
-        rag.insert(f.read())
+        # 使用补丁版本的insert方法，添加folder_id参数
+        rag.insert(f.read(), folder_id=0)
 
+    # 保持查询方法不变
     # Perform naive search
     print(
         rag.query(
@@ -89,21 +96,27 @@ def main():
     # Perform local search
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="local")
+            "What are the top themes in this story?", 
+            param=QueryParam(mode="local"),
+            folder_id=0  # 添加folder_id参数
         )
     )
 
     # Perform global search
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="global")
+            "What are the top themes in this story?", 
+            param=QueryParam(mode="global"),
+            folder_id=0  # 添加folder_id参数
         )
     )
 
     # Perform hybrid search
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="hybrid")
+            "What are the top themes in this story?", 
+            param=QueryParam(mode="hybrid"),
+            folder_id=0  # 添加folder_id参数
         )
     )
 

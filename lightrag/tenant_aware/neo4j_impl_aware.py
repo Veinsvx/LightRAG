@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, final, List, Tuple, Union
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from neo4j import AsyncGraphDatabase, exceptions as neo4jExceptions, AsyncDriver, AsyncManagedTransaction, Session
-from lightrag.utils import logger
+from lightrag.utils import logger,EmbeddingFunc
 from lightrag.kg.neo4j_impl import Neo4JStorage # 假设原始实现在这里
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge # 确保导入类型
 
@@ -21,10 +21,13 @@ class TenantAwareNeo4JStorage(Neo4JStorage):
     Assumes nodes have a 'folder_id' property and an index exists on :base(folder_id).
     """
 
-    # Override __init__ or __post_init__ if needed
-    # Keep the original initialization logic, maybe add folder_id index creation check
-
-    # Inherits _driver and _DATABASE from base class after super().initialize()
+    def __init__(self, namespace, global_config, embedding_func):
+        # 正确调用父类的 __init__ (StorageNameSpace 的)
+        super().__init__(namespace=namespace, global_config=global_config, embedding_func=embedding_func)
+        self._driver: AsyncDriver | None = None # 初始化为 None
+        self._DATABASE: str | None = None      # 初始化为 None
+        logger.debug(f"TenantAwareNeo4JStorage '{namespace}' __init__ called (driver set to None).")
+        # 不需要在这里调用 self.initialize()，它会被 RAG 主类调用
 
     async def _ensure_neo4j_index(self, session: Session, index_name: str, label: str, properties: Union[str, List[str]]):
         """Helper to create a Neo4j index if it doesn't exist."""
@@ -47,8 +50,10 @@ class TenantAwareNeo4JStorage(Neo4JStorage):
              logger.info(f"Ensured Neo4j index '{index_name}' exists for label '{label}' on properties '{prop_str_log}' in db '{self._DATABASE}'.")
         except neo4jExceptions.ClientError as e:
             # Handle potential errors, e.g., conflicting index definition
-            if "already exists" in str(e) or "concurrently" in str(e): # Check common messages
-                logger.debug(f"Index matching config for {label}({prop_str_log}) likely exists (maybe under different name or concurrent creation). Index name: '{index_name}'.")
+            # Different Neo4j versions might have different error messages
+            err_str = str(e).lower()
+            if "already exists" in err_str or "concurrently" in err_str or "token name" in err_str: # Check common messages
+                logger.debug(f"Index matching config for {label}({prop_str_log}) likely exists (maybe under different name or concurrent creation). Index name: '{index_name}'. Error: {e}")
             else:
                 logger.warning(f"Could not ensure Neo4j index '{index_name}': {e}")
         except Exception as e:
@@ -56,46 +61,92 @@ class TenantAwareNeo4JStorage(Neo4JStorage):
 
     async def initialize(self):
         """
-        Initializes the driver by calling the base class method,
-        then ensures necessary tenant-aware indexes exist.
+        Initializes the Neo4j driver for this tenant-aware storage instance
+        and ensures necessary indexes exist.
+        This method *does not* call super().initialize().
         """
-        if self._driver:
-             logger.debug("Neo4j driver already seems initialized. Skipping base initialization.")
-             # Even if driver exists, ensure indexes on the target DB
-        else:
-            # Call the base class initialize FIRST to set up self._driver and self._DATABASE
-            logger.debug("Calling super().initialize() to set up Neo4j driver and database connection...")
-            await super().initialize()
-            logger.debug(f"Base initialization complete. Using database: '{self._DATABASE}'")
+        # --- 1. 配置和建立驱动连接 ---
+        if self._driver: # 这个检查现在可以工作了
+            logger.debug(f"Neo4j driver for {self.namespace} already initialized.")
+            # 也许重新确认数据库名
+            # self._DATABASE = os.getenv("NEO4J_DATABASE", re.sub(r"[^a-zA-Z0-9-]", "-", self.namespace))
+            return
 
+        logger.info(f"Initializing Neo4j driver for namespace {self.namespace}...")
+        URI = os.getenv("NEO4J_URI", None) # 从环境获取
+        USERNAME = os.getenv("NEO4J_USERNAME", None)
+        PASSWORD = os.getenv("NEO4J_PASSWORD", None)
+        # 从 global_config 获取配置（如果需要）或保持从 env 获取
+        # config = self.global_config.get('neo4j_config', {}) # 示例
+        MAX_CONNECTION_POOL_SIZE = int(os.getenv("NEO4J_MAX_CONNECTION_POOL_SIZE", 50))
+        # ... (获取其他连接参数: TIMEOUTS, etc.)
+        CONNECTION_TIMEOUT = float(os.getenv("NEO4J_CONNECTION_TIMEOUT", 30.0))
+        CONNECTION_ACQUISITION_TIMEOUT = float(os.getenv("NEO4J_CONNECTION_ACQUISITION_TIMEOUT", 30.0))
+        MAX_TRANSACTION_RETRY_TIME = float(os.getenv("NEO4J_MAX_TRANSACTION_RETRY_TIME", 30.0))
 
-        # Now, ensure indexes exist using the initialized driver and database
-        if self._driver and self._DATABASE:
-            async with self._driver.session(database=self._DATABASE) as session:
-                 logger.info(f"Ensuring required indexes exist in Neo4j database '{self._DATABASE}'...")
-                 try:
-                      # 1. Index on :base(entity_id) - Good for general lookups
-                      await self._ensure_neo4j_index(session, "base_entity_id_idx", "base", "entity_id")
+        # **更安全的做法：使用固定的或环境变量指定的数据库**
+        self._DATABASE = os.getenv("NEO4J_DATABASE", "neo4j") # 默认使用 'neo4j'
+        logger.info(f"Targeting Neo4j database: '{self._DATABASE}' (Check NEO4J_DATABASE env var if needed)")
 
-                      # 2. Index on :base(folder_id) - Essential for tenant filtering
-                      await self._ensure_neo4j_index(session, "base_folder_id_idx", "base", "folder_id")
+        if not URI or not USERNAME or not PASSWORD:
+            raise ValueError("Missing required Neo4j connection environment variables: NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD")
 
-                      # 3. Composite Index on :base(entity_id, folder_id) - Recommended for MERGE performance
-                      await self._ensure_neo4j_index(session, "base_entity_folder_comp_idx", "base", ["entity_id", "folder_id"])
+        try:
+             self._driver: AsyncDriver = AsyncGraphDatabase.driver(
+                  URI,
+                  auth=(USERNAME, PASSWORD),
+                  max_connection_pool_size=MAX_CONNECTION_POOL_SIZE,
+                  connection_timeout=CONNECTION_TIMEOUT,
+                  connection_acquisition_timeout=CONNECTION_ACQUISITION_TIMEOUT,
+                  max_transaction_retry_time=MAX_TRANSACTION_RETRY_TIME,
+             )
+             logger.debug(f"Neo4j driver created for URI: {URI}, Target DB: {self._DATABASE}")
 
-                      logger.info(f"Required Neo4j indexes ensured for database '{self._DATABASE}'.")
+             # --- 验证连接和确保索引 (逻辑不变) ---
+             async with self._driver.session(database=self._DATABASE) as session:
+                  await session.run("MATCH (n) RETURN count(n) LIMIT 1")
+             logger.info(f"Successfully connected to Neo4j database '{self._DATABASE}'.")
+             await self._ensure_indexes() # 确保索引存在
 
-                 except Exception as e:
-                      # Catch errors during the session or index creation phase
-                      logger.error(f"Failed to ensure indexes in database '{self._DATABASE}': {e}")
-                      # Decide if this is fatal. It might impact performance significantly.
-                      # raise # Optionally re-raise the error
-        elif not self._driver:
-             logger.error("Neo4j driver was not initialized by base class. Cannot ensure indexes.")
-             raise RuntimeError("Neo4j driver initialization failed.")
-        elif not self._DATABASE:
-             logger.error("Neo4j database name (_DATABASE) was not set by base class. Cannot ensure indexes.")
-             raise RuntimeError("Neo4j database name initialization failed.")
+        except neo4jExceptions.ClientError as e:
+             # 简化处理：如果目标数据库（例如 'neo4j'）不存在或无法访问，这是严重错误
+             logger.error(f"Neo4j client error connecting to DB '{self._DATABASE}': {e}")
+             await self.finalize() # 清理驱动
+             raise ConnectionError(f"Could not connect to Neo4j DB '{self._DATABASE}'") from e
+        except neo4jExceptions.AuthError as e:
+             logger.error(f"Neo4j authentication failed: {e}")
+             await self.finalize()
+             raise e
+        except neo4jExceptions.ServiceUnavailable as e:
+             logger.error(f"Neo4j service unavailable at {URI}: {e}")
+             await self.finalize()
+             raise e
+        except Exception as e:
+             logger.error(f"Unexpected error during Neo4j initialization for DB '{self._DATABASE}': {e}")
+             await self.finalize()
+             raise e
+        
+        
+    async def _ensure_indexes(self):
+        """Internal helper to ensure required indexes exist."""
+        if not self._driver or not self._DATABASE:
+            logger.error("Cannot ensure indexes: Driver or Database not initialized.")
+            return
+
+        async with self._driver.session(database=self._DATABASE) as session:
+            logger.info(f"Ensuring required indexes exist in Neo4j database '{self._DATABASE}'...")
+            try:
+                # 1. Index on :base(entity_id)
+                await self._ensure_neo4j_index(session, "base_entity_id_idx", "base", "entity_id")
+                # 2. Index on :base(folder_id)
+                await self._ensure_neo4j_index(session, "base_folder_id_idx", "base", "folder_id")
+                # 3. Composite Index on :base(entity_id, folder_id)
+                await self._ensure_neo4j_index(session, "base_entity_folder_comp_idx", "base", ["entity_id", "folder_id"])
+                logger.info(f"Required Neo4j indexes ensured for database '{self._DATABASE}'.")
+            except Exception as e:
+                logger.error(f"Failed during index creation/verification in database '{self._DATABASE}': {e}")
+                # Decide if this is fatal
+
 
 
     # --- Override CRUD and Query Methods ---

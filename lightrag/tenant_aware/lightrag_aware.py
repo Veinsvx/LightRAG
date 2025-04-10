@@ -2,29 +2,51 @@
 import asyncio
 import os
 from dataclasses import asdict, field
-from typing import Any, AsyncIterator, Callable, Iterator, final, List, Union
+from typing import Any, AsyncIterator, Callable, Iterator, final, List, Union, Optional, Dict, Tuple
 
 # 导入原始 LightRAG 和所需类型
 from lightrag.lightrag import LightRAG
-from lightrag.base import QueryParam, StoragesStatus, BaseKVStorage, BaseVectorStorage, BaseGraphStorage, DocStatusStorage, DocStatus, DocProcessingStatus
-from lightrag.utils import logger, always_get_an_event_loop, compute_mdhash_id ,split_string_by_multi_markers # Import compute_mdhash_id
-from datetime import datetime # Import datetime
+from lightrag.base import (
+    QueryParam, StoragesStatus, BaseKVStorage, BaseVectorStorage, BaseGraphStorage,
+    DocStatusStorage, DocStatus, DocProcessingStatus
+)
+from lightrag.prompt import GRAPH_FIELD_SEP
+from lightrag.utils import (
+    logger, always_get_an_event_loop, compute_mdhash_id, limit_async_func_call,
+    check_storage_env_vars, split_string_by_multi_markers,EmbeddingFunc # 引入 check_storage_env_vars, split_string_by_multi_markers
+)
+from datetime import datetime
 from lightrag.types import KnowledgeGraph
-from lightrag.operate import extract_entities, kg_query, naive_query, mix_kg_vector_query # Assuming these are modified
+# 导入 operate 函数，假设它们已被修改或将在调用时传递 folder_id
+from lightrag.operate import extract_entities, kg_query, naive_query, mix_kg_vector_query
+from functools import partial # 引入 partial
+from lightrag.kg.shared_storage import get_namespace_data, get_pipeline_status_lock
+
+# 导入我们自定义的适配器
 from .redis_impl_aware import TenantAwareRedisKVStorage
 from .milvus_impl_aware import TenantAwareMilvusVectorDBStorage
 from .neo4j_impl_aware import TenantAwareNeo4JStorage
+# 导入基础存储类用于类型检查和可能的 fallback
+from lightrag.kg.redis_impl import RedisKVStorage
+from lightrag.kg.milvus_impl import MilvusVectorDBStorage
+from lightrag.kg.neo4j_impl import Neo4JStorage
 try:
+    # 导入原始的 JsonDocStatusStorage
     from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
 except ImportError:
-    class JsonDocStatusStorage: pass # Dummy
+    # 提供一个虚拟类以防导入失败
+    class JsonDocStatusStorage: pass
+
+# 导入其他必要的 LightRAG 内部模块
 from lightrag.namespace import make_namespace, NameSpace
-from typing import Any, AsyncIterator, Callable, Iterator, final, List, Union, Dict, Tuple, Optional # Add Dict, Tuple, Optional
-import pandas as pd # For export
-import csv # For export
-import io # For export
-from lightrag.prompt import GRAPH_FIELD_SEP # For merging attributes
-from lightrag.kg.shared_storage import get_namespace_data, get_pipeline_status_lock, initialize_share_data
+from lightrag.kg import verify_storage_implementation # 导入验证函数
+from lightrag.kg.shared_storage import initialize_share_data # 导入共享数据初始化
+from lightrag.prompt import PROMPTS # 导入 PROMPTS
+
+# 导入必要的 pandas 和 csv 用于导出
+import pandas as pd
+import csv
+import io
 
 
 @final
@@ -34,26 +56,99 @@ class MyTenantAwareLightRAG(LightRAG):
     Tenant-aware version of LightRAG that uses folder_id for data isolation.
     """
 
-    # .重写初始化存储逻辑
-    async def initialize_storages(self):
-        """Asynchronously initialize the tenant-aware storages."""
-        # 防止重复初始化
-        if self._storages_status != StoragesStatus.CREATED:
-             logger.warning(f"Storages already initialized or in incorrect state: {self._storages_status}")
-             return
+    def __init__(self, *args, **kwargs):
+        """Override init to prevent base class from auto-initializing storages too early."""
+        # Temporarily disable auto-management before calling super init
+        original_auto_manage = kwargs.get('auto_manage_storages_states', True)
+        kwargs['auto_manage_storages_states'] = False # Prevent base __post_init__ from calling initialize
 
-        logger.info("Initializing Tenant-Aware Storages...")
-        global_config = asdict(self) # 获取当前 RAG 实例的配置
+        # Call base class init
+        super().__init__(*args, **kwargs)
 
-        # --- Instantiate Tenant-Aware Adapters ---
-        # 注意: 确保将正确的 global_config 和 embedding_func 传递给适配器
-        # KV Stores (Redis for cache, full_docs, text_chunks)
+        # Restore the original auto_manage setting
+        self.auto_manage_storages_states = original_auto_manage
+
+        # Now, WE trigger the initialization if auto-management is enabled
+        if self.auto_manage_storages_states:
+             # Use the base class's safe async runner if available, otherwise run directly
+             if hasattr(self, '_run_async_safely'):
+                  self._run_async_safely(self.initialize_storages, "Tenant Storage Initialization")
+             else: # Fallback if _run_async_safely is not inherited/accessible
+                  loop = always_get_an_event_loop()
+                  if loop.is_running():
+                       loop.create_task(self.initialize_storages())
+                  else:
+                       loop.run_until_complete(self.initialize_storages())
+
+    # --- 覆盖 __post_init__ ---
+    def __post_init__(self):
+        """
+        Overrides base __post_init__. Sets up basic config, validates storage names,
+        and DIRECTLY instantiates TENANT-AWARE storage adapters.
+        """
+        logger.debug("Running MyTenantAwareLightRAG custom __post_init__...")
+
+        # 1. 执行基础 LightRAG __post_init__ 中必要的非存储实例化逻辑
+        initialize_share_data()
+
+        if not os.path.exists(self.working_dir):
+            logger.info(f"Creating working directory {self.working_dir}")
+            os.makedirs(self.working_dir)
+
+        # 验证存储实现名称和环境变量 (来自基类逻辑)
+        storage_configs = [
+            ("KV_STORAGE", self.kv_storage),
+            ("VECTOR_STORAGE", self.vector_storage),
+            ("GRAPH_STORAGE", self.graph_storage),
+            ("DOC_STATUS_STORAGE", self.doc_status_storage),
+        ]
+        for storage_type, storage_name in storage_configs:
+             verify_storage_implementation(storage_type, storage_name)
+             check_storage_env_vars(storage_name)
+
+        self.vector_db_storage_cls_kwargs = {
+            "cosine_better_than_threshold": self.cosine_better_than_threshold,
+            **self.vector_db_storage_cls_kwargs,
+        }
+
+        # 显示配置 (来自基类逻辑)
+        global_config = asdict(self)
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
+        logger.debug(f"LightRAG (TenantAware) init with param:\n  {_print_config}\n")
+
+        # --- 2. 直接实例化 Tenant-Aware 存储适配器 ---
+        # 使用 self.kv_storage 等属性中指定的 *名称* 来决定实例化哪个 Tenant-Aware 类
+        # (或者，如果名称固定，可以直接写死 TenantAware 类)
+        # 这里我们假设传入的名称 ("RedisKVStorage"等) 对应我们想要的基础类型，
+        # 然后我们硬编码使用对应的 TenantAware 版本。
+
+        logger.info("Instantiating Tenant-Aware storage adapters...")
+
+        # 确保 embedding_func 是 EmbeddingFunc 实例
+        if not isinstance(self.embedding_func, EmbeddingFunc):
+             # 如果传入的是普通函数，尝试包装它 (需要提供默认维度和大小)
+             # 这部分逻辑可能需要在调用 RAG 构造函数之前处理好
+             logger.warning("embedding_func passed to MyTenantAwareLightRAG is not an EmbeddingFunc instance. Using default values for dim/size.")
+             default_dim = 1024 # 或者从配置读取
+             default_max_tokens = 8192
+             base_func = self.embedding_func
+             self.embedding_func = EmbeddingFunc(
+                  embedding_dim=default_dim,
+                  max_token_size=default_max_tokens,
+                  func=base_func
+             )
+             # 同时包装限制器
+             self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(self.embedding_func)
+             self.embedding_func.__already_limited = True # 添加标记
+
+
+        # KV 存储 (假设总是 TenantAwareRedisKVStorage)
         self.llm_response_cache = TenantAwareRedisKVStorage(
             namespace=make_namespace(self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE),
             global_config=global_config,
             embedding_func=self.embedding_func
         )
-        self.full_docs = TenantAwareRedisKVStorage( # 假设文档和块也用 Redis
+        self.full_docs = TenantAwareRedisKVStorage(
             namespace=make_namespace(self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS),
             global_config=global_config,
             embedding_func=self.embedding_func
@@ -64,13 +159,13 @@ class MyTenantAwareLightRAG(LightRAG):
              embedding_func=self.embedding_func
         )
 
-        # Vector Stores (Milvus)
+        # Vector 存储 (假设总是 TenantAwareMilvusVectorDBStorage)
         self.entities_vdb = TenantAwareMilvusVectorDBStorage(
              namespace=make_namespace(self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES),
              global_config=global_config,
              embedding_func=self.embedding_func,
-             meta_fields={"entity_name", "source_id", "content", "file_path"}, # 保留元字段
-             **self.vector_db_storage_cls_kwargs # 传递额外参数
+             meta_fields={"entity_name", "source_id", "content", "file_path"},
+             **self.vector_db_storage_cls_kwargs
         )
         self.relationships_vdb = TenantAwareMilvusVectorDBStorage(
              namespace=make_namespace(self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS),
@@ -87,38 +182,138 @@ class MyTenantAwareLightRAG(LightRAG):
              **self.vector_db_storage_cls_kwargs
         )
 
-        # Graph Store (Neo4j)
+        # Graph 存储 (假设总是 TenantAwareNeo4JStorage)
         self.chunk_entity_relation_graph = TenantAwareNeo4JStorage(
              namespace=make_namespace(self.namespace_prefix, NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION),
              global_config=global_config,
              embedding_func=self.embedding_func
         )
 
-        # Doc Status Store (Using original Json implementation as decided)
-        # Ensure the class exists at the expected path or adjust import
+        # Doc Status 存储 (使用原始实现)
         try:
+            self.doc_status = JsonDocStatusStorage(
+                namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
+                global_config=global_config,
+                embedding_func=None,
+            )
+        except Exception as e:
+            logger.error(f"Failed to instantiate JsonDocStatusStorage: {e}")
+            raise
+
+        logger.info("Tenant-Aware storage adapters instantiated.")
+
+        # --- 3. 包装 LLM 函数 (现在可以安全访问 self.llm_response_cache) ---
+        base_llm_func = self.llm_model_func # 获取原始函数
+        if not callable(base_llm_func):
+             raise TypeError("llm_model_func provided is not callable.")
+
+        self.llm_model_func = limit_async_func_call(self.llm_model_max_async)(
+             partial(
+                  base_llm_func,
+                  hashing_kv=self.llm_response_cache, # 传递 Tenant-Aware 缓存实例
+                  **self.llm_model_kwargs
+             )
+        )
+        # 确保 embedding_func 也被包装
+        if not hasattr(self.embedding_func, "__already_limited"): # 避免重复包装
+             self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(self.embedding_func)
+             self.embedding_func.__already_limited = True
+
+        # --- 4. 设置状态 ---
+        # 此时实例已创建，但连接/索引等可能未初始化
+        self._storages_status = StoragesStatus.CREATED
+        logger.debug("MyTenantAwareLightRAG custom __post_init__ completed. Status set to CREATED.")
+
+        # 注意：我们仍然依赖外部调用 initialize_storages 来建立连接和检查索引
+
+
+
+    # --- 保持我们覆盖的 initialize_storages ---
+    # 这个方法现在只负责调用每个已存在实例的 initialize()
+    async def initialize_storages(self):
+        """Asynchronously initialize the tenant-aware storages."""
+        if self._storages_status != StoragesStatus.CREATED:
+             logger.warning(f"Skipping initialization, status: {self._storages_status}")
+             return
+
+        logger.info("Initializing Tenant-Aware Storages...")
+        global_config = asdict(self)
+
+        # --- Instantiate AND Assign Tenant-Aware Adapters ---
+        # *** FIX: Assign the created instances back to self.* attributes ***
+        logger.debug("Creating and assigning TenantAwareRedisKVStorage instances...")
+        self.llm_response_cache = TenantAwareRedisKVStorage(
+            namespace=make_namespace(self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE),
+            global_config=global_config,
+            embedding_func=self.embedding_func # Pass EmbeddingFunc instance
+        )
+        self.full_docs = TenantAwareRedisKVStorage(
+            namespace=make_namespace(self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS),
+            global_config=global_config,
+            embedding_func=self.embedding_func
+        )
+        self.text_chunks = TenantAwareRedisKVStorage(
+             namespace=make_namespace(self.namespace_prefix, NameSpace.KV_STORE_TEXT_CHUNKS),
+             global_config=global_config,
+             embedding_func=self.embedding_func
+        )
+        logger.debug("Creating and assigning TenantAwareMilvusVectorDBStorage instances...")
+        self.entities_vdb = TenantAwareMilvusVectorDBStorage(
+             namespace=make_namespace(self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES),
+             global_config=global_config,
+             embedding_func=self.embedding_func,
+             meta_fields={"entity_name", "source_id", "content", "file_path"},
+             **self.vector_db_storage_cls_kwargs
+        )
+        self.relationships_vdb = TenantAwareMilvusVectorDBStorage(
+             namespace=make_namespace(self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS),
+             global_config=global_config,
+             embedding_func=self.embedding_func,
+             meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+             **self.vector_db_storage_cls_kwargs
+        )
+        self.chunks_vdb = TenantAwareMilvusVectorDBStorage(
+             namespace=make_namespace(self.namespace_prefix, NameSpace.VECTOR_STORE_CHUNKS),
+             global_config=global_config,
+             embedding_func=self.embedding_func,
+             meta_fields={"full_doc_id", "content", "file_path"},
+             **self.vector_db_storage_cls_kwargs
+        )
+        logger.debug("Creating and assigning TenantAwareNeo4JStorage instance...")
+        self.chunk_entity_relation_graph = TenantAwareNeo4JStorage(
+             namespace=make_namespace(self.namespace_prefix, NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION),
+             global_config=global_config,
+             embedding_func=self.embedding_func
+        )
+        logger.debug("Creating and assigning JsonDocStatusStorage instance...")
+        try:
+            # DocStatusStorage 保持不变 (JsonDocStatusStorage)
             from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
             self.doc_status = JsonDocStatusStorage(
                 namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
                 global_config=global_config,
-                embedding_func=None, # Doc status doesn't need embeddings
+                embedding_func=None,
             )
         except ImportError:
              logger.error("Could not import JsonDocStatusStorage. Check path.")
              raise
 
-        # --- Initialize all storage instances ---
+        # --- Initialize all newly assigned storage instances ---
+        logger.debug("Calling initialize() on all assigned storage instances...")
         storages_to_init: List[Union[BaseKVStorage, BaseVectorStorage, BaseGraphStorage, DocStatusStorage]] = [
              self.llm_response_cache, self.full_docs, self.text_chunks,
              self.entities_vdb, self.relationships_vdb, self.chunks_vdb,
              self.chunk_entity_relation_graph, self.doc_status,
         ]
+        tasks = [storage.initialize() for storage in storages_to_init if storage and hasattr(storage, 'initialize')] # 检查 initialize 方法
+        # 添加日志以查看哪些存储将被初始化
+        initialized_names = [s.__class__.__name__ for s in storages_to_init if s and hasattr(s, 'initialize')]
+        logger.debug(f"Initializing the following storage instances: {initialized_names}")
 
-        tasks = [storage.initialize() for storage in storages_to_init if storage]
         await asyncio.gather(*tasks)
 
         self._storages_status = StoragesStatus.INITIALIZED
-        logger.info("Tenant-Aware Storages Initialized.")
+        logger.info("Tenant-Aware Storages Initialized (Instances reassigned and initialized).")
 
 
     # --- 重写需要 folder_id 的公共方法 ---

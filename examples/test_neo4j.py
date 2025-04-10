@@ -1,7 +1,8 @@
 import os
 import asyncio
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import gpt_4o_mini_complete
+from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
+from lightrag.utils import EmbeddingFunc
 from lightrag.kg.shared_storage import initialize_pipeline_status
 
 #########
@@ -16,13 +17,25 @@ if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
 
 
+async def embedding_func(texts: list[str]):
+    """嵌入函数 - 使用OpenAI的嵌入API"""
+    return await openai_embed(texts)
+
+
 async def initialize_rag():
+    # 嵌入维度 - OpenAI的text-embedding-3-large是1536维度
+    embedding_dimension = 1536  
+    
     rag = LightRAG(
         working_dir=WORKING_DIR,
-        llm_model_func=gpt_4o_mini_complete,  # Use gpt_4o_mini_complete LLM model
+        llm_model_func=gpt_4o_mini_complete,  # 使用gpt_4o_mini_complete作为LLM模型
+        embedding_func=EmbeddingFunc(
+            embedding_dim=embedding_dimension,
+            max_token_size=8192,
+            func=embedding_func,
+        ),
         graph_storage="Neo4JStorage",
         log_level="INFO",
-        # llm_model_func=gpt_4o_complete  # Optionally, use a stronger model
     )
 
     await rag.initialize_storages()

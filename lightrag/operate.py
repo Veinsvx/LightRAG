@@ -743,7 +743,7 @@ async def extract_entities(
                         "src_id": dp["src_id"],
                         "tgt_id": dp["tgt_id"],
                         "keywords": dp.get("keywords", ""),
-                        "content": f"{dp.get('src_id', '')}\t{dp.get('tgt_id', '')}\n{dp.get('keywords', '')}\n{dp.get('description', '')}",
+                        "content": f'{dp.get("src_id", "")}\t{dp.get("tgt_id", "")}\n{dp.get("keywords", "")}\n{dp.get("description", "")}',
                         "source_id": dp.get("source_id", ""),
                         "description": dp.get("description", ""),
                         "weight": dp.get("weight", 1.0), # 确保 weight 存在
@@ -2190,7 +2190,7 @@ async def naive_query(
     folder_id: int, # <--- 新增参数
     hashing_kv: BaseKVStorage | None = None, # 应该是 TenantAwareRedisKVStorage 实例
     system_prompt: str | None = None,
-) -> str | AsyncIterator[str]:
+) -> Union[str, AsyncIterator[str]]:
     """Performs a naive vector search query within a specific folder."""
     if folder_id is None:
         raise ValueError("folder_id must be provided for naive_query operation")

@@ -123,7 +123,7 @@ class RedisKVStorage(BaseKVStorage):
 
                 for k in data:
                     data[k]["_id"] = k
-            except json.JSONEncodeError as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"JSON encode error during upsert: {e}")
                 raise
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 from pymilvus import MilvusClient, DataType, FieldSchema, CollectionSchema # 确保导入必要类型
 from pymilvus.exceptions import IndexNotExistException, CollectionNotExistException, MilvusException
-from lightrag.utils import logger, compute_mdhash_id
+from lightrag.utils import logger, compute_mdhash_id,EmbeddingFunc
 from lightrag.kg.milvus_impl import MilvusVectorDBStorage # 假设原始实现在这里
 
 @final
@@ -23,13 +23,26 @@ class TenantAwareMilvusVectorDBStorage(MilvusVectorDBStorage):
 
     # Override __post_init__ to ensure schema and index exist
     def __post_init__(self):
-        # Run original post_init first (handles client creation etc.)
-        super().__post_init__()
-        if MilvusClient is None: # Check if import failed
+        # 确保 pymilvus 已导入
+        if MilvusClient is None:
              logger.error("pymilvus is not installed. Cannot initialize TenantAwareMilvusVectorDBStorage.")
-             return # Prevent further initialization if library is missing
+             return
 
-        # Ensure the collection exists and has the required schema and indexes
+        # 先调用父类的 __post_init__ 来创建 _client 等
+        try:
+            super().__post_init__()
+        except Exception as e:
+             logger.error(f"Error during base MilvusVectorDBStorage __post_init__: {e}")
+             # 如果基类初始化失败，则无法继续
+             raise RuntimeError(f"Failed to initialize base Milvus client: {e}") from e
+
+
+        # 检查 _client 是否成功创建
+        if not hasattr(self, '_client') or not self._client:
+             logger.error("Milvus client was not initialized by the base class.")
+             raise RuntimeError("Milvus client initialization failed.")
+
+        # 确保集合、模式和索引存在
         self._ensure_collection_schema_and_indexes()
 
     def _check_index_exists(self, field_name: str) -> bool:
@@ -37,38 +50,47 @@ class TenantAwareMilvusVectorDBStorage(MilvusVectorDBStorage):
         try:
             indexes = self._client.list_indexes(self.namespace)
             for index_name in indexes:
-                 try:
-                     index_desc = self._client.describe_index(self.namespace, index_name)
-                     if index_desc and index_desc.field_name == field_name:
-                          logger.debug(f"Index '{index_name}' found for field '{field_name}' in collection '{self.namespace}'.")
-                          return True
-                 except MilvusException as desc_err:
-                      # Handle potential errors if index description fails
-                      logger.warning(f"Could not describe index '{index_name}': {desc_err}")
+                try:
+                    # describe_index 返回的是 Index 对象列表或 Index 对象，不是字典
+                    index_desc_list = self._client.describe_index(self.namespace, index_name)
+                    # 假设 describe_index 返回列表，即使只有一个索引
+                    if isinstance(index_desc_list, list):
+                         if not index_desc_list: continue # 空列表
+                         index_desc = index_desc_list[0] # 取第一个
+                    else:
+                         index_desc = index_desc_list # 直接使用对象
+
+                    # 访问对象的属性
+                    if index_desc and hasattr(index_desc, 'field_name') and index_desc.field_name == field_name:
+                        logger.debug(f"Index '{index_name}' found for field '{field_name}' in collection '{self.namespace}'.")
+                        return True
+                except IndexNotExistException:
+                     logger.debug(f"Index '{index_name}' queried but does not exist (possibly race condition).")
+                     continue # 索引不存在
+                except MilvusException as desc_err:
+                    logger.warning(f"Could not describe index '{index_name}': {desc_err}")
             logger.debug(f"No index found for field '{field_name}' in collection '{self.namespace}'.")
             return False
         except CollectionNotExistException:
-             logger.debug(f"Collection '{self.namespace}' does not exist when checking index for '{field_name}'.")
-             return False # Collection doesn't exist, so index doesn't either
+            logger.debug(f"Collection '{self.namespace}' does not exist when checking index for '{field_name}'.")
+            return False
         except Exception as e:
             logger.error(f"Error checking index for field '{field_name}': {e}")
             return False # Assume index doesn't exist on error
 
-
     def _ensure_collection_schema_and_indexes(self):
-        """Ensures collection, schema, vector index, and scalar index exist."""
+        """Ensures collection, schema, and vector index exist. Skips scalar index creation."""
         try:
             collection_exists = self._client.has_collection(self.namespace)
 
             if not collection_exists:
                 logger.info(f"Collection '{self.namespace}' does not exist. Creating...")
-                # Define schema fields
+                # Define schema fields (保持不变)
                 fields = [
                     FieldSchema(name=self.primary_field, dtype=DataType.VARCHAR, is_primary=True, max_length=65535),
-                    FieldSchema(name=self.folder_id_field, dtype=DataType.INT64), # Tenant ID field
+                    FieldSchema(name=self.folder_id_field, dtype=DataType.INT64), # 仍然包含 folder_id 字段
                     FieldSchema(name=self.vector_field, dtype=DataType.FLOAT_VECTOR, dim=self.embedding_func.embedding_dim),
                 ]
-                # Dynamically add meta fields (assuming VARCHAR for simplicity)
                 for meta_field_name in self.meta_fields:
                     if meta_field_name not in [self.primary_field, self.folder_id_field, self.vector_field]:
                         fields.append(FieldSchema(name=meta_field_name, dtype=DataType.VARCHAR, max_length=65535))
@@ -76,163 +98,99 @@ class TenantAwareMilvusVectorDBStorage(MilvusVectorDBStorage):
                 schema = CollectionSchema(fields=fields, description=f"Tenant-aware collection for {self.namespace}")
                 self._client.create_collection(collection_name=self.namespace, schema=schema)
                 logger.info(f"Created collection '{self.namespace}'.")
-                collection_exists = True # Mark as created
+                collection_exists = True
 
             else:
                 logger.debug(f"Collection '{self.namespace}' already exists.")
-                # Optional: Verify existing schema if needed
+                # 可选: 验证现有模式是否包含 folder_id 字段
+                try:
+                    desc = self._client.describe_collection(self.namespace)
+                    field_names = [f.name for f in desc.fields]
+                    if self.folder_id_field not in field_names:
+                         # 如果字段确实不存在，这是一个更严重的问题，需要模式迁移或手动添加
+                         logger.error(f"CRITICAL: Collection {self.namespace} exists but lacks the required '{self.folder_id_field}' field!")
+                         raise RuntimeError(f"Missing '{self.folder_id_field}' field in existing collection {self.namespace}")
+                except Exception as desc_err:
+                    logger.warning(f"Could not describe collection {self.namespace} to verify schema: {desc_err}")
+
 
             # --- Ensure Indexes Exist ---
             if collection_exists:
-                 # 1. Ensure Vector Index Exists
+                 # 1. Ensure Vector Index Exists (保持不变)
                  if not self._check_index_exists(self.vector_field):
                       logger.info(f"Creating vector index on field '{self.vector_field}' for collection '{self.namespace}'...")
                       try:
                            vector_index_params = self._client.prepare_index_params()
                            vector_index_params.add_index(
                                 field_name=self.vector_field,
-                                index_type="AUTOINDEX", # Or specific type like "IVF_FLAT"
-                                metric_type="COSINE",    # Or "L2"
-                                # params={"nlist": 1024} # Params for specific index types
+                                index_type="AUTOINDEX", # Or specific type like "HNSW" or "IVF_FLAT"
+                                metric_type="COSINE",    # Or "L2", ensure consistency with search
+                                # params={"M": 16, "efConstruction": 200} # Example for HNSW
                            )
-                           self._client.create_index(self.namespace, vector_index_params, index_name=f"{self.vector_field}_idx")
+                           self._client.create_index(self.namespace, vector_index_params)
                            logger.info(f"Successfully created vector index on '{self.vector_field}'.")
                       except Exception as e:
                            logger.error(f"Failed to create vector index on '{self.vector_field}': {e}")
-                           # Decide if this is a fatal error
+                           # 向量索引失败通常是关键错误
+                           raise RuntimeError(f"Failed to create vector index on {self.namespace}") from e
 
-                 # 2. Ensure Scalar Index Exists on folder_id
-                 if not self._check_index_exists(self.folder_id_field):
-                      logger.info(f"Creating scalar index on field '{self.folder_id_field}' for collection '{self.namespace}'...")
-                      try:
-                           scalar_index_params = self._client.prepare_index_params()
-                           scalar_index_params.add_index(field_name=self.folder_id_field) # Use default index
-                           self._client.create_index(self.namespace, scalar_index_params, index_name=f"{self.folder_id_field}_idx")
-                           logger.info(f"Successfully created scalar index on '{self.folder_id_field}'.")
-                      except Exception as e:
-                           # Log warning as scalar index might not be strictly required or supported
-                           logger.warning(f"Could not create scalar index on '{self.folder_id_field}' (may not be needed/supported): {e}")
 
-                 # 3. Load Collection
-                 logger.debug(f"Loading collection '{self.namespace}' into memory...")
-                 self._client.load_collection(self.namespace)
-                 logger.info(f"Collection '{self.namespace}' loaded.")
+                 # 2. --- FIX: Skip Scalar Index Creation on folder_id ---
+                 logger.debug(f"Skipping explicit scalar index creation for '{self.folder_id_field}'. Milvus will handle filtering.")
 
-        except CollectionNotExistException:
-             logger.error(f"Failed to create or access collection '{self.namespace}'. Please check Milvus connection and permissions.")
-             raise # Re-raise critical error
-        except MilvusException as e:
-             logger.error(f"A Milvus specific error occurred during schema/index setup for '{self.namespace}': {e}")
-             raise
+
+                 # 3. Load Collection (保持不变)
+                 try:
+                      logger.debug(f"Ensuring collection '{self.namespace}' is loaded...")
+                      self._client.load_collection(self.namespace)
+                      logger.info(f"Collection '{self.namespace}' loaded.")
+                 except Exception as load_err:
+                      logger.error(f"Failed to load Milvus collection '{self.namespace}': {load_err}")
+                      raise RuntimeError(f"Failed to load collection {self.namespace}") from load_err
         except Exception as e:
             logger.error(f"Unexpected error ensuring Milvus collection schema/indexes for '{self.namespace}': {e}")
             raise
 
-    async def upsert(self, data: dict[str, dict[str, Any]], folder_id: int) -> None:
-        """Upserts data into Milvus, adding the folder_id."""
-        if folder_id is None:
-            raise ValueError("folder_id must be provided for tenant-aware upsert")
-        if not data:
-            return
-
-        logger.info(f"Upserting {len(data)} items to Milvus collection {self.namespace} for folder {folder_id}")
-
-        list_data: list[dict[str, Any]] = []
-        contents = []
-        ids = []
-
-        for k, v in data.items():
-            if "content" not in v:
-                 logger.warning(f"Skipping item with key {k} due to missing 'content'")
-                 continue
-            ids.append(k)
-            contents.append(v["content"])
-            # Prepare entity data for Milvus, ensuring primary key, folder_id, and vector are included later
-            entity_milvus_data = {
-                self.primary_field: k,
-                self.folder_id_field: folder_id,
-                # Add other metadata fields present in 'v' and defined in meta_fields
-                **{k_meta: v.get(k_meta) for k_meta in self.meta_fields if k_meta in v}
-            }
-            list_data.append(entity_milvus_data)
-
-        if not list_data:
-             logger.warning("No valid data to upsert after filtering.")
-             return
-
-
-        # Batch embedding calculation
-        embeddings = []
-        batch_size = self._max_batch_size
-        for i in range(0, len(contents), batch_size):
-            batch_contents = contents[i:i + batch_size]
-            batch_embeddings = await self.embedding_func(batch_contents)
-            embeddings.extend(batch_embeddings)
-
-        # Add embeddings to the list_data
-        if len(embeddings) != len(list_data):
-            raise RuntimeError(f"Mismatch between number of embeddings ({len(embeddings)}) and data entries ({len(list_data)})")
-
-        for i, embedding in enumerate(embeddings):
-            list_data[i][self.vector_field] = embedding # Add the vector
-
-        try:
-            results = self._client.upsert(collection_name=self.namespace, data=list_data)
-            logger.debug(f"Milvus upsert result for folder {folder_id}: {results}")
-        except Exception as e:
-            logger.error(f"Error upserting data to Milvus for folder {folder_id}: {e}")
-            raise
-
     async def query(
-        self, query: str, top_k: int, folder_id: int, ids: list[str] | None = None # `ids` might not be supported with `expr` in all Milvus versions/setups
+        self, query: str, top_k: int, folder_id: int, ids: list[str] | None = None
     ) -> list[dict[str, Any]]:
         """Queries Milvus, filtering by folder_id."""
         if folder_id is None:
             raise ValueError("folder_id must be provided for tenant-aware query")
 
         embedding_result = await self.embedding_func([query])
-        query_embedding = embedding_result[0].tolist() # Milvus client often expects list
+        # Ensure embedding is a list of lists for Milvus client search
+        query_embedding = [embedding_result[0].tolist()] # Wrap in another list
 
-        # Construct the filter expression
         filter_expr = f"{self.folder_id_field} == {folder_id}"
-
-        # Handle optional ID filtering - NOTE: Combining PK filter with vector search might depend on Milvus version/index
         if ids:
-             # Example: Add ID filter if needed and supported
-             # id_filter_part = f'{self.primary_field} in ["' + '", "'.join(ids) + '"]'
-             # filter_expr = f"({filter_expr}) and ({id_filter_part})"
-             logger.warning("`ids` filter provided but may not be combined effectively with vector search and folder_id filter in all Milvus setups.")
-
+            logger.warning("`ids` filter provided but may not be combined effectively with vector search and folder_id filter in all Milvus setups.")
 
         logger.debug(f"Querying Milvus collection {self.namespace} with top_k={top_k}, folder_id={folder_id}, filter='{filter_expr}'")
 
         try:
             results = self._client.search(
                 collection_name=self.namespace,
-                data=[query_embedding],
+                data=query_embedding, # Pass list of lists
                 limit=top_k,
-                filter=filter_expr, # Apply the folder_id filter
-                output_fields=list(self.meta_fields) + [self.primary_field, self.folder_id_field], # Ensure needed fields are output
-                search_params={ # Define search parameters like metric type
-                    "metric_type": "COSINE", # Or "L2"
-                    "params": {} # Add index-specific search params if needed, e.g., {"nprobe": 10} for IVF_FLAT
-                }
+                filter=filter_expr,
+                output_fields=["*"], # Fetch all fields
+                search_params={"metric_type": "COSINE", "params": {}} # Simplified params
             )
         except Exception as e:
             logger.error(f"Error querying Milvus for folder {folder_id}: {e}")
             raise
 
-        # Process results
+        # Process results - Milvus search returns a list of lists of hits
         processed_results = []
         if results and results[0]:
             for hit in results[0]:
-                # The 'entity' field might not exist; access fields directly from the hit object
+                 # Access hit attributes directly
                 entity_data = {
                     "id": hit.id,
                     "distance": hit.distance,
-                    self.folder_id_field: hit.entity.get(self.folder_id_field), # Access folder_id safely
-                     # Include other meta fields
-                     **{mf: hit.entity.get(mf) for mf in self.meta_fields if hit.entity.get(mf) is not None}
+                    # Access entity fields using .get() on the hit.entity dictionary
+                    **{k: hit.entity.get(k) for k in hit.entity.keys()}
                 }
                 processed_results.append(entity_data)
 
@@ -339,25 +297,27 @@ class TenantAwareMilvusVectorDBStorage(MilvusVectorDBStorage):
             return None
 
     async def get_by_ids(self, ids: list[str], folder_id: int) -> list[dict[str, Any]]:
-        """Gets multiple vector data by IDs within a specific folder."""
-        if folder_id is None:
-            raise ValueError("folder_id must be provided for tenant-aware get_by_ids")
-        if not ids:
-            return []
+         """Gets multiple vector data by IDs within a specific folder."""
+         if folder_id is None:
+             raise ValueError("folder_id must be provided for tenant-aware get_by_ids")
+         if not ids:
+             return []
 
-        id_list_str = '", "'.join(ids)
-        filter_expr = f'{self.primary_field} in ["{id_list_str}"] and {self.folder_id_field} == {folder_id}'
-        try:
-            result = self._client.query(
-                collection_name=self.namespace,
-                filter=filter_expr,
-                output_fields=list(self.meta_fields) + [self.primary_field, self.folder_id_field],
-                limit=len(ids) # Limit to max number of IDs requested
-            )
-            return result or []
-        except Exception as e:
-            logger.error(f"Error retrieving vector data for IDs {ids} in folder {folder_id}: {e}")
-            return []
+         # Format IDs for the 'in' expression
+         id_list_str = '", "'.join(ids)
+         filter_expr = f'{self.primary_field} in ["{id_list_str}"] and {self.folder_id_field} == {folder_id}'
+         try:
+             result = self._client.query(
+                 collection_name=self.namespace,
+                 filter=filter_expr,
+                 output_fields=["*"], # Fetch all fields
+                 # limit=len(ids) # Limit might not be needed for query by filter/PK
+             )
+             # Query returns list of dicts directly
+             return result if result else []
+         except Exception as e:
+             logger.error(f"Error retrieving vector data for IDs {ids} in folder {folder_id}: {e}")
+             return []
 
     # drop method remains global unless specifically designed for tenant drop
     # async def drop(self) -> dict[str, str]:

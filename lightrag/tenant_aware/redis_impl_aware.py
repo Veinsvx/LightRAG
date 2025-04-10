@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Set ,Dict
 from redis.asyncio import Redis, ConnectionPool
 from redis.exceptions import RedisError, ConnectionError
-from lightrag.utils import logger
+from lightrag.utils import logger,EmbeddingFunc
 from lightrag.kg.redis_impl import RedisKVStorage # 假设原始实现在这里
 
 # Constants from original file (if needed)
@@ -110,7 +110,7 @@ class TenantAwareRedisKVStorage(RedisKVStorage):
                          continue # Skip this key-value pair
                     pipe.set(tenant_key, serialized_value)
                 await pipe.execute()
-            except json.JSONEncodeError as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"JSON encode error during upsert for folder {folder_id}: {e}")
                 raise
             except Exception as e:
