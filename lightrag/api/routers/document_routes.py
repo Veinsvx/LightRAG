@@ -84,53 +84,59 @@ class InsertTextRequest(BaseModel):
 
     Attributes:
         text: The text content to be inserted into the RAG system
+        file_source: Source of the text (optional)
     """
 
     text: str = Field(
         min_length=1,
         description="The text to insert",
     )
-    file_name: Optional[str] = Field(
-        default=None,
-        description="Virtual filename to associate with this text"
-    )
+    file_source: str = Field(default=None, min_length=0, description="File Source")
 
     @field_validator("text", mode="after")
     @classmethod
-    def strip_after(cls, text: str) -> str:
+    def strip_text_after(cls, text: str) -> str:
         return text.strip()
+
+    @field_validator("file_source", mode="after")
+    @classmethod
+    def strip_source_after(cls, file_source: str) -> str:
+        return file_source.strip()
 
     class Config:
         json_schema_extra = {
             "example": {
-                "text": "This is a sample text to be inserted into the RAG system."
+                "text": "This is a sample text to be inserted into the RAG system.",
+                "file_source": "Source of the text (optional)",
             }
         }
 
 
 class InsertTextsRequest(BaseModel):
-    """Request model for inserting multiple text documents"""
+    """Request model for inserting multiple text documents
+
+    Attributes:
+        texts: List of text contents to be inserted into the RAG system
+        file_sources: Sources of the texts (optional)
+    """
 
     texts: list[str] = Field(
         min_length=1,
         description="The texts to insert",
     )
-    file_names: Optional[List[str]] = Field( # <--- 添加此字段
-        default=None,
-        description="Optional list of virtual filenames corresponding to each text"
+    file_sources: list[str] = Field(
+        default=None, min_length=0, description="Sources of the texts"
     )
 
     @field_validator("texts", mode="after")
     @classmethod
-    def strip_after(cls, texts: list[str]) -> list[str]:
+    def strip_texts_after(cls, texts: list[str]) -> list[str]:
         return [text.strip() for text in texts]
 
-    # 可选：添加校验器确保 texts 和 file_names 长度一致（如果提供 file_names）
-    @field_validator('file_names')
-    def check_lengths_match(cls, v, values):
-        if v is not None and 'texts' in values.data and len(v) != len(values.data['texts']):
-            raise ValueError('The number of file_names must match the number of texts')
-        return v
+    @field_validator("file_sources", mode="after")
+    @classmethod
+    def strip_sources_after(cls, file_sources: list[str]) -> list[str]:
+        return [file_source.strip() for file_source in file_sources]
 
     class Config:
         json_schema_extra = {
@@ -139,10 +145,9 @@ class InsertTextsRequest(BaseModel):
                     "This is the first text to be inserted.",
                     "This is the second text to be inserted.",
                 ],
-                "file_names": [ # <--- 示例中添加
-                    "s3_file_1.md",
-                    "s3_file_2.md"
-                ]
+                "file_sources": [
+                    "First file source (optional)",
+                ],
             }
         }
 
@@ -671,20 +676,26 @@ async def pipeline_index_files(rag: LightRAG, file_paths: List[Path]):
         logger.error(traceback.format_exc())
 
 
-async def pipeline_index_texts(rag: LightRAG, texts: List[str], file_names: Optional[List[str]] = None, metadata_list: Optional[List[Dict]] = None):
-    """Process a list of texts through the RAG pipeline."""
-    try:
-        logger.info(f"Starting processing of {len(texts)} text(s)")
-        # 第一步：入队文档
-        await rag.apipeline_enqueue_documents(texts, file_paths=file_names)
-        # 第二步：处理队列中的文档
-        await rag.apipeline_process_enqueue_documents()
-        logger.info(f"Successfully processed {len(texts)} text(s)")
-        return True
-    except Exception as e:
-        logger.error(f"Error processing texts: {str(e)}")
-        logger.error(traceback.format_exc())
-        return False
+async def pipeline_index_texts(
+    rag: LightRAG, texts: List[str], file_sources: List[str] = None
+):
+    """Index a list of texts
+
+    Args:
+        rag: LightRAG instance
+        texts: The texts to index
+        file_sources: Sources of the texts
+    """
+    if not texts:
+        return
+    if file_sources is not None:
+        if len(file_sources) != 0 and len(file_sources) != len(texts):
+            [
+                file_sources.append("unknown_source")
+                for _ in range(len(file_sources), len(texts))
+            ]
+    await rag.apipeline_enqueue_documents(input=texts, file_paths=file_sources)
+    await rag.apipeline_process_enqueue_documents()
 
 
 # TODO: deprecate after /insert_file is removed
@@ -824,17 +835,12 @@ def create_document_routes(
         Optional metadata and virtual file name can be provided.
         """
         try:
-            # 准备参数
-            file_names = [request.file_name] if request.file_name else None
-
-            # 添加到后台任务
             background_tasks.add_task(
-                pipeline_index_texts, 
-                rag, 
-                [request.text], 
-                file_names=file_names
+                pipeline_index_texts,
+                rag,
+                [request.text],
+                file_sources=[request.file_source],
             )
-
             return InsertResponse(
                 status="success",
                 message="Text saved successfully. Processing will continue in background.",
@@ -869,7 +875,12 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            background_tasks.add_task(pipeline_index_texts, rag, request.texts,file_names=request.file_names)
+            background_tasks.add_task(
+                pipeline_index_texts,
+                rag,
+                request.texts,
+                file_sources=request.file_sources,
+            )
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",

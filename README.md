@@ -39,7 +39,7 @@
 </div>
 
 ## 🎉 News
-
+- [X] [2025.06.05]🎯📢LightRAG now supports multimodal document parsing and RAG with MinerU integration (PDF, images, Office, tables, formulas, etc.). See the new [multimodal section](https://github.com/HKUDS/LightRAG/?tab=readme-ov-file#multimodal-document-processing-mineru-integration) below.
 - [X] [2025.03.18]🎯📢LightRAG now supports citation functionality, enabling proper source attribution.
 - [X] [2025.02.05]🎯📢Our team has released [VideoRAG](https://github.com/HKUDS/VideoRAG) understanding extremely long-context videos.
 - [X] [2025.01.13]🎯📢Our team has released [MiniRAG](https://github.com/HKUDS/MiniRAG) making RAG simpler with small models.
@@ -900,59 +900,66 @@ All operations are available in both synchronous and asynchronous versions. The 
 
 ```python
 custom_kg = {
-    "chunks": [
-        {
-            "content": "Alice and Bob are collaborating on quantum computing research.",
-            "source_id": "doc-1"
-        }
-    ],
-    "entities": [
-        {
-            "entity_name": "Alice",
-            "entity_type": "person",
-            "description": "Alice is a researcher specializing in quantum physics.",
-            "source_id": "doc-1"
-        },
-        {
-            "entity_name": "Bob",
-            "entity_type": "person",
-            "description": "Bob is a mathematician.",
-            "source_id": "doc-1"
-        },
-        {
-            "entity_name": "Quantum Computing",
-            "entity_type": "technology",
-            "description": "Quantum computing utilizes quantum mechanical phenomena for computation.",
-            "source_id": "doc-1"
-        }
-    ],
-    "relationships": [
-        {
-            "src_id": "Alice",
-            "tgt_id": "Bob",
-            "description": "Alice and Bob are research partners.",
-            "keywords": "collaboration research",
-            "weight": 1.0,
-            "source_id": "doc-1"
-        },
-        {
-            "src_id": "Alice",
-            "tgt_id": "Quantum Computing",
-            "description": "Alice conducts research on quantum computing.",
-            "keywords": "research expertise",
-            "weight": 1.0,
-            "source_id": "doc-1"
-        },
-        {
-            "src_id": "Bob",
-            "tgt_id": "Quantum Computing",
-            "description": "Bob researches quantum computing.",
-            "keywords": "research application",
-            "weight": 1.0,
-            "source_id": "doc-1"
-        }
-    ]
-}
+        "chunks": [
+            {
+                "content": "Alice and Bob are collaborating on quantum computing research.",
+                "source_id": "doc-1",
+                "file_path": "test_file",
+            }
+        ],
+        "entities": [
+            {
+                "entity_name": "Alice",
+                "entity_type": "person",
+                "description": "Alice is a researcher specializing in quantum physics.",
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            },
+            {
+                "entity_name": "Bob",
+                "entity_type": "person",
+                "description": "Bob is a mathematician.",
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            },
+            {
+                "entity_name": "Quantum Computing",
+                "entity_type": "technology",
+                "description": "Quantum computing utilizes quantum mechanical phenomena for computation.",
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            }
+        ],
+        "relationships": [
+            {
+                "src_id": "Alice",
+                "tgt_id": "Bob",
+                "description": "Alice and Bob are research partners.",
+                "keywords": "collaboration research",
+                "weight": 1.0,
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            },
+            {
+                "src_id": "Alice",
+                "tgt_id": "Quantum Computing",
+                "description": "Alice conducts research on quantum computing.",
+                "keywords": "research expertise",
+                "weight": 1.0,
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            },
+            {
+                "src_id": "Bob",
+                "tgt_id": "Quantum Computing",
+                "description": "Bob researches quantum computing.",
+                "keywords": "research application",
+                "weight": 1.0,
+                "source_id": "doc-1",
+                "file_path": "test_file"
+            }
+        ]
+    }
 
 rag.insert_custom_kg(custom_kg)
 ```
@@ -1043,6 +1050,31 @@ When merging entities:
 * Relationship weights and attributes are preserved
 
 </details>
+
+## Multimodal Document Processing (MinerU Integration)
+
+LightRAG now supports multimodal document parsing and retrieval-augmented generation (RAG) via [MinerU](https://github.com/opendatalab/MinerU). You can extract structured content (text, images, tables, formulas, etc.) from PDF, images, and Office documents, and use them in your RAG pipeline.
+
+**Key Features:**
+- Parse PDFs, images, DOC/DOCX/PPT/PPTX, and more
+- Extract and index text, images, tables, formulas, and document structure
+- Query and retrieve multimodal content (text, image, table, formula) in RAG
+- Seamless integration with LightRAG core and RAGAnything
+
+**Quick Start:**
+1. Install dependencies:
+   ```bash
+   pip install "magic-pdf[full]>=1.2.2" huggingface_hub
+   ```
+2. Download MinerU model weights (see [MinerU Integration Guide](docs/mineru_integration_en.md))
+3. Use the new `MineruParser` or RAGAnything's `process_document_complete` to process files:
+   ```python
+   from lightrag.mineru_parser import MineruParser
+   content_list, md_content = MineruParser.parse_pdf('path/to/document.pdf', 'output_dir')
+   # or for any file type:
+   content_list, md_content = MineruParser.parse_document('path/to/file', 'auto', 'output_dir')
+   ```
+4. Query multimodal content with LightRAG see [docs/mineru_integration_en.md](docs/mineru_integration_en.md).
 
 ## Token Usage Tracking
 
@@ -1236,7 +1268,7 @@ Output the results in the following structure:
 
 ### Batch Eval
 
-To evaluate the performance of two RAG systems on high-level queries, LightRAG uses the following prompt, with the specific code available in `example/batch_eval.py`.
+To evaluate the performance of two RAG systems on high-level queries, LightRAG uses the following prompt, with the specific code available in `reproduce/batch_eval.py`.
 
 <details>
 <summary> Prompt </summary>
