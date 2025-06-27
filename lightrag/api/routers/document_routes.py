@@ -1070,10 +1070,20 @@ def create_document_routes(
         request: InsertTextRequest, background_tasks: BackgroundTasks
     ):
         """
-        Insert a text directly into the RAG system.
+        Insert text into the RAG system.
 
-        This endpoint accepts a text string and processes it for inclusion in the RAG system.
-        Optional metadata and virtual file name can be provided.
+        This endpoint allows you to insert text data into the RAG system for later retrieval
+        and use in generating responses.
+
+        Args:
+            request (InsertTextRequest): The request body containing the text to be inserted.
+            background_tasks: FastAPI BackgroundTasks for async processing
+
+        Returns:
+            InsertResponse: A response object containing the status of the operation.
+
+        Raises:
+            HTTPException: If an error occurs during text processing (500).
         """
         try:
             background_tasks.add_task(
@@ -1084,7 +1094,7 @@ def create_document_routes(
             )
             return InsertResponse(
                 status="success",
-                message="Text saved successfully. Processing will continue in background.",
+                message="Text successfully received. Processing will continue in background.",
             )
         except Exception as e:
             logger.error(f"Error /documents/text: {str(e)}")
@@ -1403,7 +1413,6 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
-        logger.info(f"有人正在查询 文档状态")
         try:
             statuses = (
                 DocStatus.PENDING,
@@ -1433,7 +1442,7 @@ def create_document_routes(
                             chunks_count=doc_status.chunks_count,
                             error=doc_status.error,
                             metadata=doc_status.metadata,
-                            file_path=doc_status.file_path or "unknown",  # 处理 None 值
+                            file_path=doc_status.file_path,
                         )
                     )
             return response
